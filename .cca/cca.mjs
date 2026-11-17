@@ -37,14 +37,22 @@ function ensureDirs() {
   }
 }
 
+// Windows 에서 codex/agy 같은 .cmd 셰임을 찾으려면 shell 경유가 필요하다.
+// shell:true 로 실행하되 인자를 직접 따옴표로 감싸 안전하게 전달한다.
+function quoteArg(a) {
+  // 우리 인자는 ASCII(경로/고정 문구)뿐이라 큰따옴표 래핑으로 충분하다.
+  return `"${String(a).replace(/"/g, '\\"')}"`;
+}
+
 // 외부 명령 실행 (타임아웃 적용). 반환: {status, timedOut, notFound}
 function run(cmd, args, { capture = false } = {}) {
-  const res = spawnSync(cmd, args, {
+  const line = [cmd, ...args.map(quoteArg)].join(' ');
+  const res = spawnSync(line, {
     cwd: ROOT,
     timeout: EXTERNAL_TIMEOUT_MS,
     encoding: 'utf8',
     stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
-    shell: false,
+    shell: true,
   });
   const notFound = res.error && res.error.code === 'ENOENT';
   const timedOut = res.error && res.error.code === 'ETIMEDOUT';
