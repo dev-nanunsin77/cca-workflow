@@ -1,0 +1,5 @@
+{
+  "testCommand": "node --test",
+  "planFile": "docs/plan.md",
+  "maxDebugRetries": 5
+}
