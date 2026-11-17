@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "verdict": { "type": "string", "enum": ["accept", "reject"] },
+    "reason": { "type": "string" },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "content": { "type": "string" }
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  "required": ["verdict", "reason"]
+}

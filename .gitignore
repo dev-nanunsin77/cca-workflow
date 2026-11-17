@@ -10,6 +10,8 @@
 # agy 가 읽지 않는 순수 출력물만 무시
 .ai/debug.json
 .ai/last-test.json
+.ai/dispute.json
+.ai/test-lock.json
 
 # node
 node_modules/

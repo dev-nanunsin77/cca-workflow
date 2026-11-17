@@ -4,5 +4,7 @@
   "maxDebugRetries": 5,
   "pmReasoningEffort": "medium",
   "debugEffortFail": "high",
-  "debugEffortReview": "low"
+  "debugEffortReview": "low",
+  "testsEffort": "high",
+  "disputeEffort": "high"
 }
