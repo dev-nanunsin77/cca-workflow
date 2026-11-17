@@ -1,11 +1,12 @@
 ---
-description: cca-workflow 3-에이전트 루프(PM→구현→테스트→디버그)를 실행한다
+description: cca-workflow 3-에이전트 루프(PM→테스트선작성→구현→테스트/디버그→리뷰)를 실행한다
 ---
 
 # /cca-go — cca-workflow 실행 절차
 
 너는 Coder이자 팀 리드다. 아래 순서를 사람에게 묻지 말고 스스로 진행한다.
 **codex·agy·테스트는 절대 직접 호출하지 말고, 반드시 `node .cca/cca.mjs` 를 경유한다.**
+전체 소요 시간 측정을 위해 **시작 시각을 기록**해 둔다(보고에 총 소요 시간 포함).
 
 요구사항: $ARGUMENTS
 
@@ -15,37 +16,44 @@ description: cca-workflow 3-에이전트 루프(PM→구현→테스트→디버
 
 ## 1. 기획 (PM = Codex)
 - `node .cca/cca.mjs pm "<요구사항>"` 실행 → `docs/plan.md` 생성.
-- plan.md 의 5개 제목(목표 / 작업 목록 / 수용 기준 / 테스트 시나리오 / 위험 요소)을 확인한다.
+- plan.md 의 6개 제목(목표 / 작업 목록 / 수용 기준 / 테스트 시나리오 / 위험 요소 / **인터페이스 계약**)을 확인한다.
 
-## 2. 구현 (Coder = 너)
-- `docs/plan.md` 의 작업 목록·수용 기준에 따라 직접 구현한다.
-- **수용 기준마다 테스트를 작성**한다(기본 러너 `node --test`).
+## 2. 테스트 선작성 + 잠금 (TDD)
+- `node .cca/cca.mjs tests` 실행 → agy 가 plan 기반 테스트 파일을 생성하고 `.ai/test-lock.json` 에 해시가 잠긴다.
+- 출력에서 **red 확인**(구현 전이므로 전부 실패)을 본다. 통과 경고가 뜨면 테스트가 부실한 것이니 plan 을 점검.
+- **이후 테스트 파일을 직접 손대지 마라.** 변경은 오직 `dispute` 를 통해서만 가능하다.
 
-## 3. 테스트 루프 (실패 시에만 디버그)
-- `node .cca/cca.mjs test` 실행 (결과는 `.ai/test.log`, `.ai/last-test.json`).
-- **테스트가 실패하면** `node .cca/cca.mjs debug fail` 실행 → 원인분석.
-  - 출력 마지막 줄 `SEVERITY: <값>` 을 읽고, 수정안을 검토해 반영한 뒤 **다시 3번(test)으로 복귀**.
-  - 속도를 위해 통과한 상태에서는 매번 리뷰를 돌리지 않는다(리뷰는 4번에서 한 번만).
-- **같은 문제로 5회(`.cca/config.json` 의 `maxDebugRetries`) 이상 실패하면 멈추고 사람에게 요약 보고.**
+## 3. 구현 (Coder = 너)
+- `docs/plan.md` 의 작업 목록·수용 기준·인터페이스 계약에 따라 **구현 코드만** 작성한다(테스트 파일 금지).
 
-## 4. 최종 리뷰 (통과 후 1회)
-- 모든 테스트가 통과하면 `node .cca/cca.mjs debug review` 를 **마지막에 한 번만** 실행.
-- `SEVERITY` 가 `critical` 또는 `major` 면: 수정안을 반영하고 **3번(test)으로 복귀**(수정 후 다시 통과→리뷰).
-- `minor` 또는 `none` → 5번으로.
+## 4. 테스트 루프 (실패 시에만 디버그)
+- `node .cca/cca.mjs test` 실행. (잠금 해시와 다르면 "테스트 변조"로 실패하니 테스트를 건드리지 않는다.)
+- **테스트가 실패하면** `node .cca/cca.mjs debug fail` → `SEVERITY` 를 읽고 **구현을** 고친 뒤 4번으로 복귀.
+- 테스트가 틀렸다고 **의심되면** 구현을 억지로 맞추지 말고 `node .cca/cca.mjs dispute "<이의: plan 조항 인용 필수>"`.
+  - `VERDICT: accept` → 테스트가 교체·재잠금됨. 다시 4번(test).
+  - `VERDICT: reject` → 테스트가 옳다. 구현을 고친다.
+  - **같은 테스트에 대해 dispute 가 2회 기각되면 멈추고 사람에게 보고.**
+- **같은 문제로 5회(`maxDebugRetries`) 이상 실패하면 멈추고 사람에게 요약 보고.**
 
-## 5. 커밋 (push 금지)
-- 소스와 `docs/plan.md` 만 선택적으로 `git add` 한다(런타임 산출물 `.ai/test.log`, `.ai/changes.*`, `.ai/prompts/` 는 커밋하지 않는다).
+## 5. 최종 리뷰 (통과 후 1회)
+- 모든 테스트 통과 시 `node .cca/cca.mjs debug review` 를 **마지막에 한 번만** 실행.
+- `SEVERITY` 가 `critical`/`major` 면 구현을 고치고 4번으로 복귀. `minor`/`none` → 6번.
+
+## 6. 커밋 (push 금지)
+- 소스와 `docs/plan.md`, 잠긴 테스트 파일을 선택적으로 `git add` 한다(런타임 산출물 `.ai/` 는 커밋하지 않는다).
 - `git commit` 으로 마무리. **`git push` 는 하지 않는다.**
 
 ## 규칙: cca 도구 자체의 문제
-- 실행 중 cca 도구(`.cca/`, `.claude/`, `.ai/debug-schema.json`)에서 버그·결함을 발견해도 **그 자리에서 수정하지 마라**.
+- 실행 중 cca 도구(`.cca/`, `.claude/`, `.ai/*-schema.json`)에서 버그·결함을 발견해도 **그 자리에서 수정하지 마라**.
 - 작업 범위(요구사항 구현)와 도구 유지보수를 분리하기 위함이다.
 - 대신 최종 보고의 **"도구 이슈"** 항목에 무엇을/어디서 발견했는지 기록만 한다.
 
-## 6. 완료 보고에 반드시 포함
+## 7. 완료 보고에 반드시 포함
 - 작업 브랜치명(`cca/<기능명>`).
+- **총 소요 시간**(0번 시작부터 커밋까지).
 - 디버그 반복 횟수.
+- **dispute 횟수와 각 결과(accept/reject)**.
 - 디버거 지적별 **반영/미반영 여부와 미반영 이유**.
 - 최종 테스트 결과와 마지막 `SEVERITY`.
-- **도구 이슈**: 실행 중 발견한 cca 도구(`.cca/`, `.claude/`, `.ai/debug-schema.json`)의 문제(없으면 "없음").
+- **도구 이슈**: 실행 중 발견한 cca 도구(`.cca/`, `.claude/`, `.ai/*-schema.json`)의 문제(없으면 "없음").
 - push 하지 않았음을 명시.
