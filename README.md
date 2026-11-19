@@ -11,7 +11,8 @@
 codex·agy 호출과 테스트 실행은 모두 오케스트레이터 **`.cca/cca.mjs`** 를 경유한다.
 
 ## 사전 조건
-- Node.js 18+ (내장 `node --test` 사용).
+- Node.js 18+ (오케스트레이터 `.cca/cca.mjs` 실행용).
+- 구현 언어의 툴체인 (아래 [지원 언어](#지원-언어) 참고).
 - `codex` CLI 설치 + 로그인, PATH 등록.
 - `agy` (Antigravity) CLI 설치 + 로그인, PATH 등록.
 
@@ -42,12 +43,27 @@ node .cca/cca.mjs debug review                   # 강제: 코드 리뷰
 ## 설정 (`.cca/config.json`)
 ```json
 {
-  "testCommand": "node --test",
+  "language": "auto",
   "planFile": "docs/plan.md",
   "maxDebugRetries": 5
 }
 ```
-- `testCommand` 만 바꾸면 pytest 등으로 교체 가능 (기본값은 추가 설치 불필요).
+- `language`: `auto` | `node` | `python` | `rust` | `cpp`. PM 의 인터페이스 계약, 테스트 작성 규칙, 테스트 명령, 결과 집계가 모두 이 값을 따른다.
+- `framework`: 언어별 대안 러너. 현재 `python` 의 `"pytest"` 만 있음 (기본은 `unittest`).
+- `testCommand`: 지정하면 프리셋의 테스트 명령을 덮어쓴다.
+- 적용 결과 확인: `node .cca/cca.mjs lang`
+
+## 지원 언어
+| language | 테스트 러너 (추가 설치 없음) | 테스트 위치 | 구현자가 만드는 빌드 설정 |
+|----------|------------------------------|-------------|---------------------------|
+| `node` | `node --test` | `*.test.mjs` | — |
+| `python` | `python -m unittest discover -s tests -t .` | `tests/test_*.py` | 패키지 디렉터리 + `__init__.py` |
+| `python` + `framework: "pytest"` | `python -m pytest -q` | `tests/test_*.py` | 〃 |
+| `rust` | `cargo test` | `tests/*.rs` (통합 테스트) | `Cargo.toml`, `src/lib.rs` |
+| `cpp` | CMake + CTest (자체 미니 하네스, C++17) | `tests/test_*.cpp`, `tests/CMakeLists.txt` | 루트 `CMakeLists.txt` (라이브러리 타깃 + `enable_testing()` + `add_subdirectory(tests)`) |
+
+- `auto` 는 `Cargo.toml` → rust, `CMakeLists.txt` → cpp, `pyproject.toml`/`setup.py`/`requirements.txt` → python, `package.json` → node 순으로 추정한다. 빈 저장소에서는 추정할 수 없어 node 로 떨어지므로 **새 프로젝트는 `language` 를 명시**하자.
+- `cpp` 는 PATH 에 `cmake` 가 없으면 Visual Studio 번들 CMake(vswhere)를 자동으로 찾는다. 빌드는 `build/` 에 Debug 구성으로 한다.
 
 ## 산출물 (`.ai/`)
 | 파일 | 내용 |

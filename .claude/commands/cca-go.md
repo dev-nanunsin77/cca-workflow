@@ -13,6 +13,8 @@ description: cca-workflow 3-에이전트 루프(PM→테스트선작성→구현
 ## 0. 브랜치 생성
 - 기능명을 요구사항에서 짧은 kebab-case 로 정해 `git switch -c cca/<기능명>` 으로 작업 브랜치를 만든다.
 - 이미 해당 브랜치면 그대로 사용한다.
+- `node .cca/cca.mjs lang` 으로 구현 언어를 확인한다.
+  - 언어 추정 경고가 뜨거나 요구사항의 언어와 다르면: 요구사항에 언어가 명시돼 있을 때만 `.cca/config.json` 의 `language` 를 그 값으로 바꾼다(유일하게 허용되는 도구 설정 변경). 명시돼 있지 않으면 멈추고 사람에게 묻는다.
 
 ## 1. 기획 (PM = Codex)
 - `node .cca/cca.mjs pm "<요구사항>"` 실행 → `docs/plan.md` 생성.
@@ -25,6 +27,7 @@ description: cca-workflow 3-에이전트 루프(PM→테스트선작성→구현
 
 ## 3. 구현 (Coder = 너)
 - `docs/plan.md` 의 작업 목록·수용 기준·인터페이스 계약에 따라 **구현 코드만** 작성한다(테스트 파일 금지).
+- 빌드 설정은 구현자 몫이다: python 은 패키지 `__init__.py`, rust 는 `Cargo.toml`/`src/lib.rs`, cpp 는 루트 `CMakeLists.txt`(계약의 라이브러리 타깃 + `enable_testing()` + `add_subdirectory(tests)`).
 
 ## 4. 테스트 루프 (실패 시에만 디버그)
 - `node .cca/cca.mjs test` 실행. (잠금 해시와 다르면 "테스트 변조"로 실패하니 테스트를 건드리지 않는다.)

@@ -1,5 +1,5 @@
 {
-  "testCommand": "node --test",
+  "language": "auto",
   "planFile": "docs/plan.md",
   "maxDebugRetries": 5,
   "pmReasoningEffort": "medium",

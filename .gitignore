@@ -13,5 +13,9 @@
 .ai/dispute.json
 .ai/test-lock.json
 
-# node
+# 언어별 빌드/캐시 산출물
 node_modules/
+__pycache__/
+.pytest_cache/
+target/
+build/

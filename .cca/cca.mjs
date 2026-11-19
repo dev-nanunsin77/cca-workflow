@@ -30,7 +30,9 @@ const CONFIG = loadConfig();
 function loadConfig() {
   const p = resolve(ROOT, '.cca/config.json');
   const defaults = {
-    testCommand: 'node --test',
+    language: 'auto', // auto | node | python | rust | cpp
+    framework: null, // 언어별 대안 러너 (python: "pytest")
+    testCommand: null, // 지정 시 프리셋 명령을 덮어씀
     planFile: 'docs/plan.md',
     maxDebugRetries: 5,
     pmReasoningEffort: 'medium',
@@ -46,6 +48,175 @@ function loadConfig() {
     console.error(`[cca] .cca/config.json 파싱 실패: ${e.message}`);
     return defaults;
   }
+}
+
+// ---------- 언어 프리셋 ----------
+// 각 프리셋: PM 계약 작성 기준(contractHint), 테스트 작성 규칙(testRules),
+// 테스트 명령(testCommand), 러너 출력에서 pass/fail 수 추출(parseCounts).
+const LANG_PRESETS = {
+  node: {
+    label: 'Node.js (JavaScript ESM)',
+    testCommand: () => 'node --test',
+    contractHint:
+      'JavaScript(ESM, `.mjs`) 기준: 파일 경로, export 함수 시그니처, 입출력 타입(JSDoc 수준), throw 하는 Error 종류와 메시지.',
+    testRules: [
+      '- 러너는 `node --test` + `node:assert/strict` 를 사용한다(별도 설치 금지).',
+      '- 테스트 파일명은 `*.test.mjs` 로 하고, 구현 모듈은 계약의 경로에서 ESM 으로 import 한다.',
+    ],
+    testExample: 'csv.test.mjs',
+    parseCounts(out) {
+      const mp = out.match(/(?:ℹ\s*)?pass (\d+)/);
+      const mf = out.match(/(?:ℹ\s*)?fail (\d+)/);
+      return { pass: mp ? Number(mp[1]) : null, fail: mf ? Number(mf[1]) : null };
+    },
+  },
+  python: {
+    label: 'Python 3 (unittest)',
+    testCommand: () => 'python -m unittest discover -s tests -t . -v',
+    contractHint:
+      'Python 3 기준: 패키지/모듈 경로(저장소 루트 기준, 예: `csvtool/parser.py`), 함수·클래스 시그니처(타입 힌트 포함), 반환형, raise 하는 예외 클래스와 메시지.',
+    testRules: [
+      '- 러너는 표준 라이브러리 `unittest` 를 사용한다(pytest 등 별도 설치 금지).',
+      '- 테스트 파일은 `tests/test_*.py` 에 두고, 빈 `tests/__init__.py` 도 함께 만든다.',
+      '- 구현 패키지는 저장소 루트 기준 절대 import 한다(예: `from csvtool.parser import parse`). sys.path 조작 금지.',
+    ],
+    testExample: 'tests/test_parser.py',
+    parseCounts(out) {
+      const ran = out.match(/^Ran (\d+) tests?/m);
+      if (!ran) return { pass: null, fail: null };
+      const total = Number(ran[1]);
+      const n = (k) => Number((out.match(new RegExp(`${k}=(\\d+)`)) || [])[1] || 0);
+      const fail = n('failures') + n('errors');
+      return { pass: Math.max(0, total - fail - n('skipped')), fail };
+    },
+  },
+  'python:pytest': {
+    label: 'Python 3 (pytest)',
+    testCommand: () => 'python -m pytest -q',
+    contractHint: null, // python 과 동일
+    testRules: [
+      '- 러너는 `pytest` 를 사용한다(플러그인 등 추가 설치 금지).',
+      '- 테스트 파일은 `tests/test_*.py` 에 두고, 빈 `tests/__init__.py` 도 함께 만든다.',
+      '- 구현 패키지는 저장소 루트 기준 절대 import 한다(예: `from csvtool.parser import parse`). sys.path 조작 금지.',
+    ],
+    testExample: 'tests/test_parser.py',
+    parseCounts(out) {
+      const n = (k) => {
+        const m = out.match(new RegExp(`(\\d+) ${k}`));
+        return m ? Number(m[1]) : null;
+      };
+      const pass = n('passed');
+      const failed = n('failed');
+      const errors = n('errors?');
+      if (pass == null && failed == null && errors == null) return { pass: null, fail: null };
+      return { pass: pass ?? 0, fail: (failed ?? 0) + (errors ?? 0) };
+    },
+  },
+  rust: {
+    label: 'Rust (cargo test)',
+    testCommand: () => 'cargo test --color never',
+    contractHint:
+      'Rust 기준: 크레이트 이름(Cargo.toml `package.name`, lib 크레이트), 모듈 경로, `pub fn`/`pub struct` 시그니처(소유권·참조 포함), 반환형, 에러 타입(`Result<T, E>` 의 E 정의와 Display 메시지).',
+    testRules: [
+      '- 통합 테스트로 `tests/*.rs` 에 작성하고 `cargo test` 로 실행된다(외부 크레이트 추가 금지).',
+      '- 계약의 크레이트 이름으로 `use <crate>::...` 한다(크레이트명의 `-` 는 `_`).',
+      '- `Cargo.toml` 과 `src/` 는 구현자가 만든다. 테스트 쪽에서 만들지 마라.',
+    ],
+    testExample: 'tests/parser.rs',
+    parseCounts(out) {
+      let pass = 0;
+      let fail = 0;
+      let found = false;
+      for (const m of out.matchAll(/test result: \w+\. (\d+) passed; (\d+) failed/g)) {
+        found = true;
+        pass += Number(m[1]);
+        fail += Number(m[2]);
+      }
+      return found ? { pass, fail } : { pass: null, fail: null };
+    },
+  },
+  cpp: {
+    label: 'C++17 (CMake + CTest)',
+    testCommand() {
+      const { cmake, ctest } = findCmake();
+      return [
+        `${cmake} -S . -B build`,
+        `${cmake} --build build --config Debug`,
+        `${ctest} --test-dir build -C Debug --output-on-failure`,
+      ].join(' && ');
+    },
+    contractHint:
+      'C++17 + CMake 기준: 라이브러리 CMake 타깃 이름, 헤더 경로(include 기준 경로), 네임스페이스, 함수/클래스 시그니처, 반환형, 에러 처리 방식(예외 타입과 what() 메시지, 또는 std::optional/에러코드).',
+    testRules: [
+      '- 외부 테스트 프레임워크(GoogleTest, Catch2 등) 금지. 표준 라이브러리만 쓰는 자체 미니 하네스로 작성한다.',
+      '- 테스트 파일은 `tests/test_*.cpp`. 실행파일은 인자로 케이스 이름을 받아 해당 케이스만 실행하고, 실패 시 stderr 에 이유를 출력하고 1 을 반환한다.',
+      '- `tests/CMakeLists.txt` 도 함께 작성한다: 각 파일을 `add_executable` + `target_link_libraries(<계약의 라이브러리 타깃>)` 로 빌드하고, **케이스마다** `add_test(NAME <케이스> COMMAND <실행파일> <케이스>)` 로 등록한다.',
+      '- 루트 `CMakeLists.txt`(라이브러리 타깃 정의, `enable_testing()`, `add_subdirectory(tests)`)는 구현자가 만든다. 테스트 쪽에서 만들지 마라.',
+    ],
+    testExample: 'tests/test_parser.cpp',
+    parseCounts(out) {
+      const m = out.match(/(\d+)% tests passed, (\d+) tests? failed out of (\d+)/);
+      if (!m) return { pass: null, fail: null };
+      const fail = Number(m[2]);
+      return { pass: Number(m[3]) - fail, fail };
+    },
+  },
+};
+
+// 저장소 내용으로 언어 추정 (language: "auto")
+function detectLanguage() {
+  const has = (f) => existsSync(resolve(ROOT, f));
+  if (has('Cargo.toml')) return 'rust';
+  if (has('CMakeLists.txt')) return 'cpp';
+  if (has('pyproject.toml') || has('setup.py') || has('requirements.txt')) return 'python';
+  if (has('package.json')) return 'node';
+  return null;
+}
+
+let _lang;
+function getLang() {
+  if (_lang) return _lang;
+  let language = CONFIG.language || 'auto';
+  if (language === 'auto') {
+    const d = detectLanguage();
+    if (!d) console.warn('[cca] ⚠ language=auto 인데 언어를 추정할 수 없어 node 로 진행합니다. .cca/config.json 의 language 를 지정하세요.');
+    language = d || 'node';
+  }
+  const key = CONFIG.framework ? `${language}:${CONFIG.framework}` : language;
+  const preset = LANG_PRESETS[key];
+  if (!preset) {
+    console.error(`[cca] 지원하지 않는 언어/프레임워크: ${key} (지원: ${Object.keys(LANG_PRESETS).join(', ')})`);
+    process.exit(2);
+  }
+  const base = LANG_PRESETS[language];
+  _lang = {
+    key,
+    ...preset,
+    contractHint: preset.contractHint || base.contractHint,
+    testCommand: CONFIG.testCommand || preset.testCommand(),
+  };
+  return _lang;
+}
+
+// PATH 에 cmake 가 없으면 Visual Studio 번들 CMake 를 찾는다.
+function findCmake() {
+  const onPath = spawnSync(process.platform === 'win32' ? 'where cmake' : 'command -v cmake', {
+    shell: true,
+    encoding: 'utf8',
+  });
+  if (onPath.status === 0 && onPath.stdout.trim()) return { cmake: 'cmake', ctest: 'ctest' };
+  if (process.platform === 'win32') {
+    const vswhere = 'C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe';
+    if (existsSync(vswhere)) {
+      const r = spawnSync(vswhere, ['-latest', '-products', '*', '-property', 'installationPath'], { encoding: 'utf8' });
+      const vs = (r.stdout || '').trim().split(/\r?\n/)[0];
+      const bin = vs && resolve(vs, 'Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin');
+      if (bin && existsSync(resolve(bin, 'cmake.exe')))
+        return { cmake: quoteArg(resolve(bin, 'cmake.exe')), ctest: quoteArg(resolve(bin, 'ctest.exe')) };
+    }
+  }
+  console.warn('[cca] ⚠ cmake 를 찾지 못했습니다. PATH 에 추가하거나 config.testCommand 를 지정하세요.');
+  return { cmake: 'cmake', ctest: 'ctest' };
 }
 
 function ensureDirs() {
@@ -152,8 +323,8 @@ function writeLock(filesMap) {
 // ---------- 테스트 실행(원시) ----------
 function runTestsRaw() {
   ensureDirs();
-  const testCmd = CONFIG.testCommand || 'node --test';
-  console.log(`[cca] 테스트 실행: ${testCmd}`);
+  const testCmd = getLang().testCommand;
+  console.log(`[cca] 테스트 실행 [${getLang().key}]: ${testCmd}`);
   const start = process.hrtime.bigint();
   const res = spawnSync(testCmd, {
     cwd: ROOT,
@@ -177,14 +348,9 @@ function runTestsRaw() {
   return { exitCode, passed, out };
 }
 
-// node --test 요약에서 pass/fail 수 추출(다른 러너면 null)
+// 러너 요약에서 pass/fail 수 추출(파싱 불가면 null)
 function parseCounts(out) {
-  const mp = out.match(/(?:ℹ\s*)?pass (\d+)/);
-  const mf = out.match(/(?:ℹ\s*)?fail (\d+)/);
-  return {
-    pass: mp ? Number(mp[1]) : null,
-    fail: mf ? Number(mf[1]) : null,
-  };
+  return getLang().parseCounts(out);
 }
 
 // ---------- pm ----------
@@ -205,6 +371,9 @@ function cmdPm(requirement) {
     '- `## 테스트 시나리오`',
     '- `## 위험 요소`',
     '- `## 인터페이스 계약`  (파일명, export 함수 시그니처, 입출력 타입, 에러 형식/메시지 규약을 구체적으로)',
+    '',
+    `구현 언어: **${getLang().label}**. 인터페이스 계약은 이 언어 기준으로 작성하라 —`,
+    getLang().contractHint,
     '',
     '`## 인터페이스 계약` 은 이후 단계에서 테스트를 먼저 작성하는 근거가 되므로,',
     '모호함 없이 파일 경로·함수명·인자·반환형·에러 조건을 못박아라.',
@@ -246,13 +415,14 @@ function cmdTests() {
     '',
     '규칙:',
     '- 구현 코드는 아직 존재하지 않는다. 테스트는 인터페이스 계약에 명시된 모듈/함수를 import 해 검증한다.',
-    '- 러너는 `node --test` + `node:assert` 를 사용한다(별도 설치 금지).',
+    `- 언어/러너: **${getLang().label}**. 실행 명령은 \`${getLang().testCommand}\` 이다.`,
+    ...getLang().testRules,
     '- 각 수용 기준/시나리오를 빠짐없이 커버하라.',
     '- 테스트만 작성하라. 구현 파일은 만들지 마라.',
     '- **다른 파일을 열지 마라.** 아래 첨부된 plan 내용만으로 작성하라.',
     '',
     '출력은 요구된 JSON 스키마 `{ files: [{ path, content }] }` 로만 응답하라.',
-    'path 는 저장소 루트 기준 상대 경로다(예: `csv.test.mjs`).',
+    `path 는 저장소 루트 기준 상대 경로다(예: \`${getLang().testExample}\`).`,
     '',
     '===== plan.md =====',
     readSafe(planAbs),
@@ -353,6 +523,8 @@ function cmdDispute(claim) {
     '- 이의가 plan 의 조항(인터페이스 계약/수용 기준/테스트 시나리오)에 근거해 테스트가 틀렸음을 입증하면 `accept`.',
     '- 단지 구현이 어렵거나 테스트가 엄격하다는 이유라면 `reject`.',
     '- `accept` 인 경우, plan 에 부합하도록 수정한 **테스트 파일 전체 내용**을 files 로 함께 제시하라.',
+    `- 수정 테스트도 원래 규칙을 따른다 (${getLang().label}):`,
+    ...getLang().testRules.map((r) => '  ' + r),
     '- **다른 파일을 열지 마라.** 아래 첨부된 plan 과 현재 테스트만 근거로 판정하라.',
     '',
     '출력은 요구된 JSON 스키마 `{ verdict: "accept"|"reject", reason, files?: [{path,content}] }` 로만.',
@@ -459,7 +631,7 @@ function cmdDebug(modeArg) {
   let header;
   if (mode === 'fail') {
     header = [
-      '너는 디버거다. 테스트가 실패했다.',
+      `너는 디버거다. 테스트가 실패했다. (언어/러너: ${getLang().label}, 명령: \`${getLang().testCommand}\`)`,
       '아래에 **필요한 모든 정보(테스트 로그, git diff, git status, 신규 파일 내용)를 직접 첨부**했다.',
       '**추가로 다른 파일을 열지 마라.** 첨부된 내용만으로 실패 원인과 구체적 수정안을 제시하라.',
       '**파일은 수정하지 마라.** 특히 테스트 파일은 잠겨 있으니 구현을 고치는 방향으로 제안하라.',
@@ -468,7 +640,7 @@ function cmdDebug(modeArg) {
     ];
   } else {
     header = [
-      '너는 코드 리뷰어다. 테스트는 이미 통과했다(로그는 불필요하여 첨부하지 않음).',
+      `너는 코드 리뷰어다. 테스트는 이미 통과했다(로그는 불필요하여 첨부하지 않음). 언어: ${getLang().label}.`,
       '아래에 **git diff, git status, 신규 파일 내용을 직접 첨부**했다.',
       '**추가로 다른 파일을 열지 마라.** 첨부된 변경 코드만 리뷰하라. **파일은 수정하지 마라.**',
       '버그·설계 결함·누락된 처리를 찾아 severity 로 평가하라.',
@@ -554,7 +726,8 @@ function usage() {
   node .cca/cca.mjs tests                   plan 기반 테스트 선작성 + 잠금 + red 확인
   node .cca/cca.mjs test                    잠금 검증 후 테스트 실행
   node .cca/cca.mjs debug [fail|review]     디버거(agy) 실행 (모드 생략 시 자동판단)
-  node .cca/cca.mjs dispute "<이의 내용>"   테스트 이의를 agy 가 판정(accept 시 교체)`);
+  node .cca/cca.mjs dispute "<이의 내용>"   테스트 이의를 agy 가 판정(accept 시 교체)
+  node .cca/cca.mjs lang                    적용될 언어 프리셋과 테스트 명령 출력`);
 }
 
 const [sub, ...rest] = process.argv.slice(2);
@@ -574,6 +747,10 @@ switch (sub) {
     break;
   case 'dispute':
     code = cmdDispute(rest.join(' ').trim());
+    break;
+  case 'lang':
+    console.log(`language: ${getLang().key} (${getLang().label})`);
+    console.log(`testCommand: ${getLang().testCommand}`);
     break;
   default:
     usage();
