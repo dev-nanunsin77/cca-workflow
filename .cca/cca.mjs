@@ -11,11 +11,11 @@
 //   dispute : 테스트가 틀렸다는 이의를 agy 가 판정, accept 면 테스트 교체 + 해시 갱신.
 
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { completeCoder, createRun, drive, findStep, recordDispute, validateWorkflow } from './engine.mjs';
+import { lockHash } from './lock.mjs';
 import { parseAgy, untrackedFiles } from './parse.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -320,9 +320,6 @@ function readSafe(abs) {
     return '';
   }
 }
-function sha256(s) {
-  return createHash('sha256').update(s, 'utf8').digest('hex');
-}
 
 // 저장소 루트 안에 있는 상대 경로만 허용(경로 이탈 차단)
 function safeRel(p) {
@@ -345,7 +342,7 @@ function saveFiles(files) {
     const abs = resolve(ROOT, rel);
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, f.content, 'utf8');
-    map[rel] = sha256(f.content);
+    map[rel] = lockHash(f.content);
     console.log(`[cca] 테스트 파일 저장: ${rel}`);
   }
   return map;
@@ -514,7 +511,7 @@ function taskTest() {
   if (lock && lock.files) {
     const tampered = [];
     for (const [rel, h] of Object.entries(lock.files)) {
-      const cur = sha256(readSafe(resolve(ROOT, rel)));
+      const cur = lockHash(readSafe(resolve(ROOT, rel)));
       if (cur !== h) tampered.push(rel);
     }
     if (tampered.length) {
