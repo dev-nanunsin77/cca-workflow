@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { completeCoder, createRun, drive, findStep, recordDispute, validateWorkflow } from './engine.mjs';
+import { parseAgy } from './parse.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..'); // 저장소 루트
@@ -234,16 +235,18 @@ function quoteArg(a) {
 }
 
 // 외부 명령 실행 (타임아웃 + 소요시간 출력).
-function run(cmd, args, { capture = false, label } = {}) {
-  const line = [cmd, ...args.map(quoteArg)].join(' ');
+// shell: true 는 .cmd 셰임(codex 등)용. 실행 파일(agy.exe)은 shell: false 로 직접 실행하면
+// cmd.exe 의 8191자 제한·줄바꿈 깨짐 없이 긴 프롬프트를 인자로 넘길 수 있다(CreateProcess 32767자).
+function run(cmd, args, { capture = false, label, shell = true } = {}) {
   const start = process.hrtime.bigint();
-  const res = spawnSync(line, {
+  const opts = {
     cwd: ROOT,
     timeout: EXTERNAL_TIMEOUT_MS,
     encoding: 'utf8',
     stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
-    shell: true,
-  });
+    shell,
+  };
+  const res = shell ? spawnSync([cmd, ...args.map(quoteArg)].join(' '), opts) : spawnSync(cmd, args, opts);
   const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
   const notFound = res.error && res.error.code === 'ENOENT';
   const timedOut = res.error && res.error.code === 'ETIMEDOUT';
@@ -267,6 +270,43 @@ function writePrompt(name, body) {
 }
 function followInstruction(relPath) {
   return `Read the file ${relPath} and follow its instructions exactly.`;
+}
+
+// ---------- agy 호출 ----------
+// 프롬프트는 인자로 직접 넘긴다. "파일을 읽어라" 간접 지시는 agy(plan 모드)가 셸로 파일을 찾다
+// 권한 거부(denied_actions)되고 빈 결과로 끝나는 일이 있다. 한도를 넘는 프롬프트만 파일 지시로 대체.
+// CreateProcess 한도 32767자에서 다른 인자와 따옴표 이스케이프(\") 증가분 여유를 둔다
+const AGY_INLINE_MAX = 24000;
+const SEVERITIES = ['critical', 'major', 'minor', 'none'];
+
+function runAgy(name, promptBody, { effort, schema, label }) {
+  const rel = writePrompt(name, promptBody);
+  const inline = promptBody.length <= AGY_INLINE_MAX;
+  if (!inline) console.warn(`[cca] ⚠ 프롬프트가 ${promptBody.length}자라 파일 지시(${rel})로 전달합니다.`);
+  const args = (prompt) => ['-p', prompt, '--mode', 'plan', '--effort', effort,
+    '--output-format', 'json', '--json-schema', schema, '--print-timeout', '5m'];
+  const r = run('agy', args(inline ? promptBody : followInstruction(rel)), { capture: true, label, shell: false });
+  // 셸 없이는 .exe 만 찾는다. agy 가 .cmd 셰임으로 설치된 환경이면 셸 + 파일 지시로 대체
+  if (r.notFound && process.platform === 'win32') {
+    console.warn('[cca] ⚠ agy 실행 파일(.exe)을 찾지 못해 셸 경유(파일 지시)로 재시도합니다.');
+    return run('agy', args(followInstruction(rel)), { capture: true, label });
+  }
+  return r;
+}
+
+// agy 실행 실패(프로세스) 또는 결과 없음(parseAgy) 이면 사유 문자열, 정상이면 null
+function agyFailed(r, label, parsed) {
+  if (r.notFound || r.timedOut || r.status !== 0) {
+    console.error(`[cca] ${label} 실행 실패.`);
+    if (r.stderr) console.error(r.stderr.trim());
+    return `${label} 실행 실패${r.timedOut ? '(타임아웃)' : r.notFound ? '(실행 파일 없음)' : ` (exit ${r.status})`}`;
+  }
+  if (!parsed.data) {
+    console.error(`[cca] ${label} 결과가 비었거나 형식이 다릅니다: ${parsed.diag}`);
+    console.error(`[cca] 원본: ${r.stdout.slice(0, 2000)}`);
+    return `결과 없음 — ${parsed.diag}`;
+  }
+  return null;
 }
 function tailLines(text, n = TAIL_LINES) {
   const lines = (text || '').split('\n');
@@ -429,27 +469,13 @@ function taskWriteTests() {
     '===== plan.md =====',
     readSafe(planAbs),
   ].join('\n');
-  const rel = writePrompt('tests', promptBody);
-
   console.log(`[cca] 테스트 작성(agy, effort=${effort})...`);
-  const r = run(
-    'agy',
-    ['-p', followInstruction(rel), '--mode', 'plan', '--effort', effort,
-      '--output-format', 'json', '--json-schema', '.ai/tests-schema.json', '--print-timeout', '5m'],
-    { capture: true, label: 'agy(tests)' }
-  );
+  const r = runAgy('tests', promptBody, { effort, schema: '.ai/tests-schema.json', label: 'agy(tests)' });
   const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/test-lock.json' };
-  if (r.notFound || r.timedOut || r.status !== 0) {
-    console.error('[cca] agy(tests) 실행 실패.');
-    if (r.stderr) console.error(r.stderr.trim());
-    return { ...base, result: 'error', summary: 'agy(tests) 실행 실패' };
-  }
-  const parsed = extractJson(r.stdout, 'files');
-  if (!parsed || !Array.isArray(parsed.files) || parsed.files.length === 0) {
-    console.error('[cca] agy 출력에서 files 를 파싱하지 못했습니다. 원본:');
-    console.error(r.stdout);
-    return { ...base, result: 'error', summary: 'files 파싱 실패' };
-  }
+  const p = parseAgy(r.stdout, 'files', (d) => Array.isArray(d.files) && d.files.length > 0);
+  const failMsg = agyFailed(r, 'agy(tests)', p);
+  if (failMsg) return { ...base, result: 'error', summary: failMsg };
+  const parsed = p.data;
 
   const map = saveFiles(parsed.files);
   if (Object.keys(map).length === 0) {
@@ -549,27 +575,13 @@ function taskDispute(claim) {
     '===== 현재 잠긴 테스트 =====',
     lockedFiles,
   ].join('\n');
-  const rel = writePrompt('dispute', promptBody);
-
   console.log(`[cca] 이의 판정(agy, effort=${effort})...`);
-  const r = run(
-    'agy',
-    ['-p', followInstruction(rel), '--mode', 'plan', '--effort', effort,
-      '--output-format', 'json', '--json-schema', '.ai/dispute-schema.json', '--print-timeout', '5m'],
-    { capture: true, label: 'agy(dispute)' }
-  );
+  const r = runAgy('dispute', promptBody, { effort, schema: '.ai/dispute-schema.json', label: 'agy(dispute)' });
   const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/dispute.json' };
-  if (r.notFound || r.timedOut || r.status !== 0) {
-    console.error('[cca] agy(dispute) 실행 실패.');
-    if (r.stderr) console.error(r.stderr.trim());
-    return { ...base, result: 'error', summary: 'agy(dispute) 실행 실패' };
-  }
-  const parsed = extractJson(r.stdout, 'verdict');
-  if (!parsed || !parsed.verdict) {
-    console.error('[cca] agy 출력에서 verdict 를 파싱하지 못했습니다. 원본:');
-    console.error(r.stdout);
-    return { ...base, result: 'error', summary: 'verdict 파싱 실패' };
-  }
+  const p = parseAgy(r.stdout, 'verdict', (d) => d.verdict === 'accept' || d.verdict === 'reject');
+  const failMsg = agyFailed(r, 'agy(dispute)', p);
+  if (failMsg) return { ...base, result: 'error', summary: failMsg };
+  const parsed = p.data;
   writeFileSync(resolve(AI_DIR, 'dispute.json'), JSON.stringify(parsed, null, 2), 'utf8');
 
   console.log('\n===== 이의 판정 =====');
@@ -660,30 +672,21 @@ function taskDebug(mode) {
       '',
     ];
   }
-  const rel = writePrompt('debug', [...header, ...attachments].join('\n'));
-
   console.log('[cca] 디버거(agy) 실행...');
-  const r = run(
-    'agy',
-    ['-p', followInstruction(rel), '--mode', 'plan', '--effort', effort,
-      '--output-format', 'json', '--json-schema', '.ai/debug-schema.json', '--print-timeout', '5m'],
-    { capture: true, label: `agy(${mode})` }
-  );
+  const r = runAgy('debug', [...header, ...attachments].join('\n'), {
+    effort,
+    schema: '.ai/debug-schema.json',
+    label: `agy(${mode})`,
+  });
   const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/debug.json' };
-  if (r.notFound || r.timedOut || r.status !== 0) {
-    console.error('[cca] agy 실행 실패.');
-    if (r.stderr) console.error(r.stderr.trim());
-    return { ...base, result: 'error', summary: `agy(${mode}) 실행 실패` };
-  }
-  const parsed = extractJson(r.stdout, 'severity');
-  if (!parsed) {
-    console.error('[cca] agy 출력에서 JSON 을 파싱하지 못했습니다. 원본:');
-    console.error(r.stdout);
-    return { ...base, result: 'error', summary: 'JSON 파싱 실패' };
-  }
+  // severity 가 없으면 'none' 으로 간주하지 않는다(빈 결과가 리뷰 통과로 처리되는 것을 막음)
+  const p = parseAgy(r.stdout, 'severity', (d) => SEVERITIES.includes(d.severity));
+  const failMsg = agyFailed(r, `agy(${mode})`, p);
+  if (failMsg) return { ...base, result: 'error', summary: failMsg };
+  const parsed = p.data;
   writeFileSync(resolve(AI_DIR, 'debug.json'), JSON.stringify(parsed, null, 2), 'utf8');
 
-  const severity = parsed.severity ?? 'none';
+  const severity = parsed.severity;
   console.log('\n===== 디버거 결과 =====');
   console.log(`[원인/요약] ${parsed.root_cause ?? '(없음)'}`);
   console.log(`[수정/제안] ${parsed.fix_suggestion ?? '(없음)'}`);
@@ -692,42 +695,6 @@ function taskDebug(mode) {
   console.log('=======================\n');
   console.log(`SEVERITY: ${severity}`);
   return { ...base, result: severity, summary: parsed.root_cause ?? null };
-}
-
-// agy json 출력에서 특정 key 를 가진 객체를 견고하게 추출
-function extractJson(text, key) {
-  const trimmed = (text || '').trim();
-  if (!trimmed) return null;
-  const direct = tryParse(trimmed);
-  if (direct && typeof direct === 'object') {
-    const found = findWithKey(direct, key);
-    return found || direct;
-  }
-  const s = trimmed.indexOf('{');
-  const e = trimmed.lastIndexOf('}');
-  if (s >= 0 && e > s) {
-    const obj = tryParse(trimmed.slice(s, e + 1));
-    if (obj) return findWithKey(obj, key) || obj;
-  }
-  return null;
-}
-function findWithKey(obj, key) {
-  if (!obj || typeof obj !== 'object') return null;
-  if (Object.prototype.hasOwnProperty.call(obj, key)) return obj;
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === 'object') {
-      const r = findWithKey(v, key);
-      if (r) return r;
-    }
-  }
-  return null;
-}
-function tryParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
 }
 
 // ---------- workflow run (run / next / status / abort) ----------

@@ -101,7 +101,7 @@ node .cca/cca.mjs debug review                   # 강제: 코드 리뷰
 ## 산출물 (`.ai/`)
 | 파일 | 내용 |
 |------|------|
-| `prompts/*.md` | codex/agy 에 전달한 실제 프롬프트 (CLI 에는 "이 파일을 읽고 그대로 따르라" 만 전달) |
+| `prompts/*.md` | codex/agy 에 전달한 실제 프롬프트 (기록용). codex 에는 "이 파일을 읽고 따르라" 로, agy 에는 프롬프트 본문을 인자로 직접 전달한다(24,000자 초과 시에만 파일 지시) |
 | `test.log` | 마지막 테스트 출력 |
 | `run.json` | 현재 run 상태 (workflow, 현재 step, 방문 횟수, dispute, step 별 기록) |
 | `last-test.json` | 마지막 테스트 통과 여부 (debug 모드 자동판단용) |
