@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // cca-workflow 오케스트레이션 CLI
-// 하위 명령: pm / tests / test / debug / dispute
+// 워크플로: run / next / status / abort  (흐름 정의는 .cca/workflows/*.json, 전이는 engine.mjs)
+// 단일 명령: pm / tests / test / debug / dispute
 // codex(PM) · agy(Debugger/테스트작성/판정) 호출과 테스트 실행을 이 한 곳으로 통일한다.
 //
 // "테스트 선작성 + 테스트 잠금" 구조:
@@ -11,9 +12,10 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { completeCoder, createRun, drive, findStep, recordDispute, validateWorkflow } from './engine.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..'); // 저장소 루트
@@ -35,6 +37,7 @@ function loadConfig() {
     testCommand: null, // 지정 시 프리셋 명령을 덮어씀
     planFile: 'docs/plan.md',
     maxDebugRetries: 5,
+    maxDisputeRejects: 2, // run 하나에서 dispute 기각이 이 횟수에 닿으면 escalated
     pmReasoningEffort: 'medium',
     debugEffortFail: 'high',
     debugEffortReview: 'low',
@@ -353,12 +356,10 @@ function parseCounts(out) {
   return getLang().parseCounts(out);
 }
 
-// ---------- pm ----------
-function cmdPm(requirement) {
-  if (!requirement) {
-    console.error('[cca] 사용법: node .cca/cca.mjs pm "<요구사항>"');
-    return 2;
-  }
+// ---------- task: plan (PM) ----------
+// task 함수는 { result, summary?, artifact?, backend?, elapsedMs? } 를 반환한다.
+// result 는 워크플로 전이 키다. 실행 자체가 실패하면 'error'.
+function taskPlan(requirement) {
   const promptBody = [
     '너는 PM이다. 아래 요구사항을 분석해 Markdown 문서를 작성한다.',
     '',
@@ -391,22 +392,23 @@ function cmdPm(requirement) {
     ['exec', '-c', `model_reasoning_effort=${effort}`, followInstruction(rel), '-s', 'read-only', '-o', planFile],
     { label: 'codex(pm)' }
   );
+  const base = { backend: 'codex', elapsedMs: r.elapsedMs, artifact: planFile };
   if (r.status === 0 && existsSync(resolve(ROOT, planFile))) {
     console.log(`[cca] plan 생성 완료: ${planFile}`);
-  } else {
-    console.error('[cca] PM 단계 실패.');
+    return { ...base, result: 'ok' };
   }
-  return r.status;
+  console.error('[cca] PM 단계 실패.');
+  return { ...base, result: 'error', summary: `codex exit ${r.status}` };
 }
 
-// ---------- tests (테스트 선작성 + 잠금) ----------
-function cmdTests() {
+// ---------- task: write_tests (테스트 선작성 + 잠금) ----------
+function taskWriteTests() {
   ensureDirs();
   const planFile = CONFIG.planFile || 'docs/plan.md';
   const planAbs = resolve(ROOT, planFile);
   if (!existsSync(planAbs)) {
     console.error(`[cca] ${planFile} 가 없습니다. 먼저 pm 을 실행하세요.`);
-    return 2;
+    return { result: 'error', summary: `${planFile} 없음` };
   }
   const effort = CONFIG.testsEffort || 'high';
   const promptBody = [
@@ -436,22 +438,23 @@ function cmdTests() {
       '--output-format', 'json', '--json-schema', '.ai/tests-schema.json', '--print-timeout', '5m'],
     { capture: true, label: 'agy(tests)' }
   );
+  const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/test-lock.json' };
   if (r.notFound || r.timedOut || r.status !== 0) {
     console.error('[cca] agy(tests) 실행 실패.');
     if (r.stderr) console.error(r.stderr.trim());
-    return 1;
+    return { ...base, result: 'error', summary: 'agy(tests) 실행 실패' };
   }
   const parsed = extractJson(r.stdout, 'files');
   if (!parsed || !Array.isArray(parsed.files) || parsed.files.length === 0) {
     console.error('[cca] agy 출력에서 files 를 파싱하지 못했습니다. 원본:');
     console.error(r.stdout);
-    return 1;
+    return { ...base, result: 'error', summary: 'files 파싱 실패' };
   }
 
   const map = saveFiles(parsed.files);
   if (Object.keys(map).length === 0) {
     console.error('[cca] 저장된 테스트 파일이 없습니다.');
-    return 1;
+    return { ...base, result: 'error', summary: '저장된 테스트 파일 없음' };
   }
   writeLock(map);
   console.log(`[cca] 테스트 잠금 기록: .ai/test-lock.json (${Object.keys(map).length}개 파일)`);
@@ -460,6 +463,7 @@ function cmdTests() {
   console.log('[cca] red 확인을 위해 테스트 1회 실행...');
   const t = runTestsRaw();
   const { pass, fail } = parseCounts(t.out);
+  let red;
   if (pass != null) {
     if (pass > 0)
       console.warn(`[cca] ⚠ 경고: 통과하는 테스트가 ${pass}개 있습니다. 테스트는 모두 실패(red)여야 합니다.`);
@@ -467,16 +471,19 @@ function cmdTests() {
       console.warn('[cca] ⚠ 경고: 실패(red)하는 테스트가 없습니다. 테스트가 구현을 제대로 강제하는지 확인하세요.');
     if (pass === 0 && fail != null && fail > 0)
       console.log('[cca] ✅ red 확인: 모든 테스트가 실패 상태입니다.');
+    red = `red 확인: pass ${pass} / fail ${fail ?? '?'}`;
   } else if (t.passed) {
     console.warn('[cca] ⚠ 경고: 테스트가 통과했습니다(red 여야 함).');
+    red = '⚠ 테스트가 통과함(red 아님)';
   } else {
     console.log('[cca] red 확인: 테스트가 실패 상태입니다(카운트 파싱 불가).');
+    red = 'red 확인(카운트 파싱 불가)';
   }
-  return 0;
+  return { ...base, result: 'ok', summary: `${Object.keys(map).length}개 파일 잠금, ${red}` };
 }
 
-// ---------- test (잠금 검증 후 실행) ----------
-function cmdTest() {
+// ---------- task: test (잠금 검증 후 실행) ----------
+function taskTest() {
   const lock = loadLock();
   if (lock && lock.files) {
     const tampered = [];
@@ -488,25 +495,29 @@ function cmdTest() {
       console.error('[cca] ❌ 테스트 변조 감지. 잠금과 다른 테스트 파일:');
       for (const f of tampered) console.error(`  - ${f}`);
       console.error('[cca] 테스트는 직접 수정할 수 없습니다. 변경이 필요하면 `dispute` 로 이의를 제기하세요.');
-      return 3;
+      return { result: 'tampered', exitCode: 3, summary: `변조: ${tampered.join(', ')}` };
     }
   } else {
     console.warn('[cca] ⚠ 테스트 잠금(.ai/test-lock.json)이 없습니다. 먼저 `tests` 로 생성하세요.');
   }
+  const start = process.hrtime.bigint();
   const t = runTestsRaw();
-  return t.exitCode;
+  const { pass, fail } = parseCounts(t.out);
+  return {
+    result: t.passed ? 'pass' : 'fail',
+    exitCode: t.exitCode,
+    elapsedMs: Number(process.hrtime.bigint() - start) / 1e6,
+    artifact: '.ai/test.log',
+    summary: pass != null ? `pass ${pass} / fail ${fail ?? '?'}` : `exit ${t.exitCode}`,
+  };
 }
 
-// ---------- dispute (테스트 이의 판정) ----------
-function cmdDispute(claim) {
-  if (!claim) {
-    console.error('[cca] 사용법: node .cca/cca.mjs dispute "<이의 내용 (plan 조항 인용 필수)>"');
-    return 2;
-  }
+// ---------- task: judge_dispute (테스트 이의 판정) ----------
+function taskDispute(claim) {
   const lock = loadLock();
   if (!lock || !lock.files) {
     console.error('[cca] 잠긴 테스트가 없습니다. 먼저 `tests` 를 실행하세요.');
-    return 2;
+    return { result: 'error', summary: '잠긴 테스트 없음' };
   }
   const planFile = CONFIG.planFile || 'docs/plan.md';
   const effort = CONFIG.disputeEffort || 'high';
@@ -547,16 +558,17 @@ function cmdDispute(claim) {
       '--output-format', 'json', '--json-schema', '.ai/dispute-schema.json', '--print-timeout', '5m'],
     { capture: true, label: 'agy(dispute)' }
   );
+  const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/dispute.json' };
   if (r.notFound || r.timedOut || r.status !== 0) {
     console.error('[cca] agy(dispute) 실행 실패.');
     if (r.stderr) console.error(r.stderr.trim());
-    return 1;
+    return { ...base, result: 'error', summary: 'agy(dispute) 실행 실패' };
   }
   const parsed = extractJson(r.stdout, 'verdict');
   if (!parsed || !parsed.verdict) {
     console.error('[cca] agy 출력에서 verdict 를 파싱하지 못했습니다. 원본:');
     console.error(r.stdout);
-    return 1;
+    return { ...base, result: 'error', summary: 'verdict 파싱 실패' };
   }
   writeFileSync(resolve(AI_DIR, 'dispute.json'), JSON.stringify(parsed, null, 2), 'utf8');
 
@@ -575,22 +587,21 @@ function cmdDispute(claim) {
     console.log('[cca] reject: 테스트는 그대로 유지됩니다.');
   }
   console.log(`VERDICT: ${parsed.verdict}`);
-  return 0;
+  return { ...base, result: parsed.verdict, summary: parsed.reason ?? null };
 }
 
-// ---------- debug ----------
-function cmdDebug(modeArg) {
-  ensureDirs();
-  let mode = modeArg;
-  if (mode !== 'fail' && mode !== 'review') {
-    let passed = false;
-    try {
-      passed = JSON.parse(readFileSync(resolve(AI_DIR, 'last-test.json'), 'utf8')).passed === true;
-    } catch {
-      passed = false;
-    }
-    mode = passed ? 'review' : 'fail';
+// ---------- task: analyze_failure / review (agy 디버거) ----------
+// 디버그 모드 자동판단: 마지막 테스트가 통과면 review, 아니면 fail
+function autoDebugMode() {
+  try {
+    return JSON.parse(readFileSync(resolve(AI_DIR, 'last-test.json'), 'utf8')).passed === true ? 'review' : 'fail';
+  } catch {
+    return 'fail';
   }
+}
+
+function taskDebug(mode) {
+  ensureDirs();
   const effort =
     (mode === 'fail' ? CONFIG.debugEffortFail : CONFIG.debugEffortReview) ||
     (mode === 'fail' ? 'high' : 'low');
@@ -658,16 +669,17 @@ function cmdDebug(modeArg) {
       '--output-format', 'json', '--json-schema', '.ai/debug-schema.json', '--print-timeout', '5m'],
     { capture: true, label: `agy(${mode})` }
   );
+  const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/debug.json' };
   if (r.notFound || r.timedOut || r.status !== 0) {
     console.error('[cca] agy 실행 실패.');
     if (r.stderr) console.error(r.stderr.trim());
-    return 1;
+    return { ...base, result: 'error', summary: `agy(${mode}) 실행 실패` };
   }
   const parsed = extractJson(r.stdout, 'severity');
   if (!parsed) {
     console.error('[cca] agy 출력에서 JSON 을 파싱하지 못했습니다. 원본:');
     console.error(r.stdout);
-    return 1;
+    return { ...base, result: 'error', summary: 'JSON 파싱 실패' };
   }
   writeFileSync(resolve(AI_DIR, 'debug.json'), JSON.stringify(parsed, null, 2), 'utf8');
 
@@ -679,7 +691,7 @@ function cmdDebug(modeArg) {
     console.log(`[대상 파일] ${parsed.files_to_change.join(', ')}`);
   console.log('=======================\n');
   console.log(`SEVERITY: ${severity}`);
-  return 0;
+  return { ...base, result: severity, summary: parsed.root_cause ?? null };
 }
 
 // agy json 출력에서 특정 key 를 가진 객체를 견고하게 추출
@@ -718,10 +730,244 @@ function tryParse(s) {
   }
 }
 
+// ---------- workflow run (run / next / status / abort) ----------
+const RUN_PATH = resolve(AI_DIR, 'run.json');
+const WORKFLOWS_DIR = resolve(__dirname, 'workflows');
+const ACTIVE = new Set(['running', 'waiting_coder', 'failed']);
+
+// workflow 의 agent step 이 부를 수 있는 task
+const TASKS = {
+  plan: (step, rs) => taskPlan(rs.requirement),
+  write_tests: () => taskWriteTests(),
+  analyze_failure: () => taskDebug('fail'),
+  review: () => taskDebug('review'),
+};
+const EXECUTORS = {
+  agent: (step, rs) => TASKS[step.task](step, rs),
+  test: () => taskTest(),
+};
+
+function listWorkflows() {
+  try {
+    return readdirSync(WORKFLOWS_DIR)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => f.slice(0, -5));
+  } catch {
+    return [];
+  }
+}
+
+function loadWorkflow(name) {
+  const p = resolve(WORKFLOWS_DIR, `${name}.json`);
+  if (!/^[\w-]+$/.test(name || '') || !existsSync(p)) {
+    console.error(`[cca] workflow '${name}' 가 없습니다. (사용 가능: ${listWorkflows().join(', ') || '없음'})`);
+    return null;
+  }
+  let wf;
+  try {
+    wf = JSON.parse(readFileSync(p, 'utf8'));
+  } catch (e) {
+    console.error(`[cca] workflow '${name}' 파싱 실패: ${e.message}`);
+    return null;
+  }
+  const errors = validateWorkflow(wf, { tasks: Object.keys(TASKS) });
+  if (errors.length) {
+    console.error(`[cca] workflow '${name}' 정의 오류:`);
+    for (const e of errors) console.error(`  - ${e}`);
+    return null;
+  }
+  return wf;
+}
+
+function loadRun() {
+  try {
+    return JSON.parse(readFileSync(RUN_PATH, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+function saveRun(rs) {
+  ensureDirs();
+  writeFileSync(RUN_PATH, JSON.stringify(rs, null, 2), 'utf8');
+}
+
+function fmtMs(ms) {
+  if (ms == null) return '-';
+  const s = Math.round(ms / 1000);
+  return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+}
+
+// Claude 가 읽는 결과 블록. ACTION 줄로 다음 행동을 지시한다.
+function reportRun(rs, wf) {
+  const step = wf && findStep(wf, rs.current);
+  const lastCoder = rs.history.map((h) => h.kind).lastIndexOf('coder');
+  const recent = rs.history.slice(lastCoder + 1);
+  const lines = ['', '===== cca run =====', `RUN: ${rs.id} (workflow: ${rs.workflow})`, `STATUS: ${rs.status}`];
+  for (const h of recent) {
+    const tag = h.task ? `${h.step}(${h.task}${h.backend ? `@${h.backend}` : ''})` : h.step;
+    const extra = [h.summary, h.artifact && `[${h.artifact}]`].filter(Boolean).join(' ');
+    lines.push(`RESULT: ${tag} → ${h.result}${extra ? ` — ${extra}` : ''}`);
+  }
+  if (rs.status === 'waiting_coder') {
+    lines.push(`STEP: ${rs.current}`, 'ACTION: implement');
+    if (step && step.instruction) lines.push(`INSTRUCTION: ${step.instruction}`);
+    lines.push('NEXT: 작업을 마치면 `node .cca/cca.mjs next` (테스트가 틀렸다면 `dispute "<이의>"`)');
+  } else if (rs.status === 'done') {
+    lines.push('ACTION: commit', `ELAPSED: ${fmtMs(new Date(rs.endedAt) - new Date(rs.startedAt))}`);
+  } else if (rs.status === 'escalated') {
+    lines.push('ACTION: report', `REASON: ${rs.note}`);
+  } else if (rs.status === 'failed') {
+    lines.push(`STEP: ${rs.current}`, 'ACTION: retry', `REASON: ${rs.note}`);
+    lines.push('NEXT: 원인을 해결한 뒤 `node .cca/cca.mjs next` 로 같은 step 재시도, 또는 `abort`');
+  } else if (rs.status === 'aborted') {
+    lines.push('ACTION: none');
+  }
+  lines.push('===================');
+  console.log(lines.join('\n'));
+}
+
+function exitCodeOf(rs) {
+  return { waiting_coder: 0, done: 0, aborted: 0, escalated: 4, failed: 1 }[rs.status] ?? 1;
+}
+
+function driveAndReport(rs, wf) {
+  drive(rs, wf, { executors: EXECUTORS, config: CONFIG, save: saveRun });
+  reportRun(rs, wf);
+  return exitCodeOf(rs);
+}
+
+function cmdRun(args) {
+  const i = args.indexOf('--reason');
+  const reason = i >= 0 ? args[i + 1] ?? null : null;
+  const pos = i >= 0 ? [...args.slice(0, i), ...args.slice(i + 2)] : args;
+  const [flow, ...reqParts] = pos;
+  const requirement = reqParts.join(' ').trim();
+  if (!flow || !requirement) {
+    console.error('[cca] 사용법: node .cca/cca.mjs run <workflow> "<요구사항>" [--reason "<선택 근거>"]');
+    console.error(`[cca] 사용 가능한 workflow: ${listWorkflows().join(', ') || '없음'}`);
+    return 2;
+  }
+  const prev = loadRun();
+  if (prev && ACTIVE.has(prev.status)) {
+    console.error(`[cca] 진행 중인 run 이 있습니다: ${prev.id} (status=${prev.status}, step=${prev.current}).`);
+    console.error('[cca] 이어서 하려면 `next`, 버리려면 `abort` 후 다시 실행하세요.');
+    return 2;
+  }
+  const wf = loadWorkflow(flow);
+  if (!wf) return 2;
+  const rs = createRun({ workflow: wf, requirement, reason });
+  saveRun(rs);
+  console.log(`[cca] run 시작: ${rs.id}`);
+  return driveAndReport(rs, wf);
+}
+
+function cmdNext() {
+  const rs = loadRun();
+  if (!rs) {
+    console.error('[cca] run 이 없습니다. `run <workflow> "<요구사항>"` 으로 시작하세요.');
+    return 2;
+  }
+  const wf = loadWorkflow(rs.workflow);
+  if (!wf) return 2;
+  if (rs.status === 'waiting_coder') completeCoder(rs, wf);
+  else if (!ACTIVE.has(rs.status)) {
+    console.log(`[cca] run 이 이미 끝났습니다 (status=${rs.status}).`);
+    reportRun(rs, wf);
+    return exitCodeOf(rs);
+  }
+  return driveAndReport(rs, wf);
+}
+
+function cmdStatus() {
+  const rs = loadRun();
+  if (!rs) {
+    console.log('[cca] run 이 없습니다.');
+    return 0;
+  }
+  console.log(`요구사항: ${rs.requirement}`);
+  if (rs.reason) console.log(`선택 근거: ${rs.reason}`);
+  console.log(`시작: ${rs.startedAt}${rs.endedAt ? `  종료: ${rs.endedAt}` : ''}`);
+  console.log('\n기록:');
+  for (const h of rs.history) {
+    const tag = h.task ? `${h.step}(${h.task}${h.backend ? `@${h.backend}` : ''})` : h.step;
+    console.log(`  ${tag.padEnd(28)} ${String(h.result).padEnd(9)} ${fmtMs(h.elapsedMs).padStart(7)}  ${h.summary ?? ''}`);
+  }
+  if (rs.disputes.length) {
+    console.log('\ndispute:');
+    for (const d of rs.disputes) console.log(`  ${d.step}: ${d.verdict} — ${d.reason ?? ''}`);
+  }
+  reportRun(rs, loadWorkflow(rs.workflow));
+  return 0;
+}
+
+function cmdAbort() {
+  const rs = loadRun();
+  if (!rs || !ACTIVE.has(rs.status)) {
+    console.log('[cca] 진행 중인 run 이 없습니다.');
+    return 0;
+  }
+  rs.status = 'aborted';
+  rs.endedAt = new Date().toISOString();
+  saveRun(rs);
+  console.log(`[cca] run 중단: ${rs.id}`);
+  return 0;
+}
+
+// ---------- 단일 명령 (수동 사용) ----------
+function cmdPm(requirement) {
+  if (!requirement) {
+    console.error('[cca] 사용법: node .cca/cca.mjs pm "<요구사항>"');
+    return 2;
+  }
+  return taskPlan(requirement).result === 'ok' ? 0 : 1;
+}
+
+function cmdTests() {
+  return taskWriteTests().result === 'ok' ? 0 : 1;
+}
+
+function cmdTest() {
+  return taskTest().exitCode;
+}
+
+function cmdDebug(modeArg) {
+  const mode = modeArg === 'fail' || modeArg === 'review' ? modeArg : autoDebugMode();
+  return taskDebug(mode).result === 'error' ? 1 : 0;
+}
+
+// 진행 중인 run 의 coder step 에서 호출되면 결과를 run 에 기록한다.
+function cmdDispute(claim) {
+  if (!claim) {
+    console.error('[cca] 사용법: node .cca/cca.mjs dispute "<이의 내용 (plan 조항 인용 필수)>"');
+    return 2;
+  }
+  const r = taskDispute(claim);
+  if (r.result === 'error') return 1;
+  const rs = loadRun();
+  if (rs && rs.status === 'waiting_coder') {
+    const rejects = recordDispute(rs, { verdict: r.result, reason: r.summary }, { maxRejects: CONFIG.maxDisputeRejects });
+    saveRun(rs);
+    if (rs.status === 'escalated') {
+      reportRun(rs, loadWorkflow(rs.workflow));
+      return exitCodeOf(rs);
+    }
+    if (r.result === 'reject') console.log(`[cca] 이 run 의 dispute 기각 ${rejects}/${CONFIG.maxDisputeRejects}회`);
+  }
+  return 0;
+}
+
 // ---------- main ----------
 function usage() {
   console.log(`cca-workflow CLI
-사용법:
+워크플로:
+  node .cca/cca.mjs run <workflow> "<요구사항>" [--reason "..."]
+                                            run 시작. 자동 step 을 진행하고 Claude 차례(ACTION)에서 멈춤
+  node .cca/cca.mjs next                    Claude 작업 완료 → 다음 step 진행 (실패한 step 재시도도 이것)
+  node .cca/cca.mjs status                  현재 run 기록과 다음 행동
+  node .cca/cca.mjs abort                   현재 run 중단
+  사용 가능한 workflow: ${listWorkflows().join(', ') || '없음'}
+
+단일 명령:
   node .cca/cca.mjs pm "<요구사항>"        PM(codex)로 docs/plan.md 생성
   node .cca/cca.mjs tests                   plan 기반 테스트 선작성 + 잠금 + red 확인
   node .cca/cca.mjs test                    잠금 검증 후 테스트 실행
@@ -733,6 +979,18 @@ function usage() {
 const [sub, ...rest] = process.argv.slice(2);
 let code = 0;
 switch (sub) {
+  case 'run':
+    code = cmdRun(rest);
+    break;
+  case 'next':
+    code = cmdNext();
+    break;
+  case 'status':
+    code = cmdStatus();
+    break;
+  case 'abort':
+    code = cmdAbort();
+    break;
   case 'pm':
     code = cmdPm(rest.join(' ').trim());
     break;

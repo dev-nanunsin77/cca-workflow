@@ -25,13 +25,46 @@ Claude Code 에서:
 
 그러면 Claude 가 다음을 자동 수행한다:
 1. `cca/<기능명>` 브랜치 생성
-2. `node .cca/cca.mjs pm "<요구사항>"` → `docs/plan.md`
-3. plan 기준 구현 + 수용 기준별 테스트 작성
-4. `node .cca/cca.mjs test` → `node .cca/cca.mjs debug`
-5. `SEVERITY` 가 critical/major 면 수정 후 재시도 (최대 `maxDebugRetries` 회)
-6. 통과 시 커밋 (**push 안 함**) 후 보고
+2. `node .cca/cca.mjs run feature-tdd "<요구사항>"` → cca 가 plan(codex), 테스트 선작성·잠금(agy)을 진행하고 Claude 차례에서 멈춤
+3. Claude 가 구현 → `node .cca/cca.mjs next` → cca 가 테스트 → (실패 시 원인분석) → 리뷰를 진행
+4. 다시 구현이 필요하면 2~3 반복 (디버그·리뷰 한도 `maxDebugRetries`)
+5. `ACTION: commit` 이 나오면 커밋 (**push 안 함**) 후 보고
 
-## 수동 사용
+## 워크플로
+흐름은 `.cca/workflows/<name>.json` 에 정의하고, 전이는 `.cca/engine.mjs` 가 결정한다.
+진행 상태는 `.ai/run.json` 에 step 마다 저장된다.
+
+```bash
+node .cca/cca.mjs run feature-tdd "CSV 파서" --reason "새 기능"   # 시작
+node .cca/cca.mjs next      # Claude 작업 완료 → 다음 step (실패한 step 재시도도 이것)
+node .cca/cca.mjs status    # 기록·다음 행동
+node .cca/cca.mjs abort     # 중단
+```
+
+cca 출력 끝의 블록이 다음 행동을 지시한다:
+```
+===== cca run =====
+RUN: 20261123-063000-feature-tdd (workflow: feature-tdd)
+STATUS: waiting_coder
+RESULT: retest → fail — pass 7 / fail 2 [.ai/test.log]
+RESULT: analyze(analyze_failure@agy) → major — 따옴표 이스케이프 미처리 [.ai/debug.json]
+STEP: fix
+ACTION: implement
+INSTRUCTION: 디버거 분석(.ai/debug.json)을 검토해 구현을 고친다. ...
+===================
+```
+`ACTION` 은 `implement`(Claude 차례) / `commit`(완료) / `report`(한도 도달, 사람에게 보고) / `retry`(외부 CLI 실패) 중 하나다.
+
+| step kind | 실행 | 결과(전이 키) |
+|-----------|------|---------------|
+| `agent` | task(`plan`, `write_tests`, `analyze_failure`, `review`) | `ok`, 또는 severity(`critical`/`major`/`minor`/`none`) |
+| `test` | 잠금 검증 + 테스트 | `pass` / `fail` / `tampered` |
+| `coder` | Claude (cca 는 멈춤) | `next` 호출 시 `ok` |
+
+`on` 으로 결과별 다음 step 을 지정하고(`default`, 종료는 `done`), `maxVisits` 로 반복 한도를 둔다(숫자 또는 config 키).
+엔진 테스트: `node --test .cca/test/*.test.mjs`
+
+## 수동 사용 (단일 명령)
 ```bash
 node .cca/cca.mjs pm "로그인 폼에 검증 추가"   # docs/plan.md 생성
 node .cca/cca.mjs test                         # 테스트 → .ai/test.log
@@ -70,6 +103,7 @@ node .cca/cca.mjs debug review                   # 강제: 코드 리뷰
 |------|------|
 | `prompts/*.md` | codex/agy 에 전달한 실제 프롬프트 (CLI 에는 "이 파일을 읽고 그대로 따르라" 만 전달) |
 | `test.log` | 마지막 테스트 출력 |
+| `run.json` | 현재 run 상태 (workflow, 현재 step, 방문 횟수, dispute, step 별 기록) |
 | `last-test.json` | 마지막 테스트 통과 여부 (debug 모드 자동판단용) |
 | `changes.diff` | `git diff` |
 | `changes.status` | `git status --porcelain` (신규 `??` 파일 포함) |
