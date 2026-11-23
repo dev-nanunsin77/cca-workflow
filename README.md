@@ -2,12 +2,15 @@
 
 **C**laude + **C**odex + **A**ntigravity 3-에이전트 개발 워크플로.
 
-| 역할 | 에이전트 | 하는 일 |
-|------|----------|---------|
-| Coder / 팀 리드 | **Claude** (너) | 루프 구동, 구현, 테스트 작성, 커밋 |
-| PM | **Codex** (`codex exec`) | 요구사항 → `docs/plan.md` 기획 |
-| Debugger / Reviewer | **Antigravity** (`agy`) | 테스트 실패 원인분석 또는 코드리뷰 |
+| 역할 | 기본 backend (→ fallback) | 하는 일 |
+|------|---------------------------|---------|
+| Coder / 팀 리드 | **Claude** (너) | 루프 구동, 구현, 커밋 |
+| pm | **Codex** → agy | 요구사항 → `docs/plan.md` 기획 |
+| tester | **Antigravity** → codex | plan 기반 테스트 선작성 |
+| debugger / reviewer | **Antigravity** → codex | 테스트 실패 원인분석 / 코드리뷰 |
+| judge | **Antigravity** → codex | 테스트 이의(dispute) 판정 |
 
+역할별 backend 순서는 [`.cca/roles.json`](.cca/roles.json) 에서 바꾼다([역할과 backend](#역할과-backend)).
 codex·agy 호출과 테스트 실행은 모두 오케스트레이터 **`.cca/cca.mjs`** 를 경유한다.
 
 ## 사전 조건
@@ -62,7 +65,23 @@ INSTRUCTION: 디버거 분석(.ai/debug.json)을 검토해 구현을 고친다. 
 | `coder` | Claude (cca 는 멈춤) | `next` 호출 시 `ok` |
 
 `on` 으로 결과별 다음 step 을 지정하고(`default`, 종료는 `done`), `maxVisits` 로 반복 한도를 둔다(숫자 또는 config 키).
-엔진 테스트: `node --test .cca/test/*.test.mjs`
+도구 단위 테스트(엔진·파싱·라우팅): `node --test .cca/test/*.test.mjs`
+
+## 역할과 backend
+`.cca/roles.json` 이 task → 역할 → backend 순서를 정한다. 확인: `node .cca/cca.mjs roles`
+```json
+{
+  "roles": { "tester": { "backends": ["agy", "codex"] }, "...": {} },
+  "tasks": { "write_tests": "tester", "...": "..." }
+}
+```
+- 앞의 backend 가 **실패하면 다음 backend 로 넘긴다**: 실행 파일 없음, 타임아웃, 비정상 종료(사용량 한도 포함), 빈 결과·형식 불일치.
+  fallback 이 일어나면 run 기록의 backend 가 `agy→codex` 처럼 남고, 앞 backend 의 실패 사유가 요약에 붙는다.
+- 사용량 한도는 CLI 출력의 일반적인 문구(`usage limit`, `rate limit`, `429`, `quota` 등)로 추정한다. **codex·agy 의 실제 한도 응답 형태는 아직 실측하지 못했다.**
+- 모든 backend 는 읽기 전용으로 실행한다(codex `-s read-only`, agy `--mode plan`). 파일 쓰기(plan, 테스트)는 cca 가 결과를 받아 수행한다.
+- 프롬프트 전달: codex 는 stdin(`exec -`), agy 는 인자로 직접(24,000자 초과 시에만 파일 지시). JSON task 는 codex `--output-schema` / agy `--json-schema` 로 강제하며,
+  codex 용 스키마는 OpenAI 구조화 출력 규칙(모든 속성 required, `additionalProperties: false`, 선택 속성은 `null` 허용)으로 변환해 `.ai/out/` 에 만든다.
+- effort 는 backend 가 받는 값으로 맞춘다(예: `max` → codex `xhigh`).
 
 ## 수동 사용 (단일 명령)
 ```bash
@@ -101,15 +120,16 @@ node .cca/cca.mjs debug review                   # 강제: 코드 리뷰
 ## 산출물 (`.ai/`)
 | 파일 | 내용 |
 |------|------|
-| `prompts/*.md` | codex/agy 에 전달한 실제 프롬프트 (기록용). codex 에는 "이 파일을 읽고 따르라" 로, agy 에는 프롬프트 본문을 인자로 직접 전달한다(24,000자 초과 시에만 파일 지시) |
+| `prompts/*.md` | backend 에 전달한 실제 프롬프트 (기록용) |
+| `out/` | codex 의 마지막 메시지(`-o`)와 변환된 엄격 스키마 |
 | `test.log` | 마지막 테스트 출력 |
 | `run.json` | 현재 run 상태 (workflow, 현재 step, 방문 횟수, dispute, step 별 기록) |
 | `last-test.json` | 마지막 테스트 통과 여부 (debug 모드 자동판단용) |
 | `changes.diff` | `git diff` |
 | `changes.status` | `git status --porcelain` (신규 `??` 파일 포함) |
-| `debug.json` | agy 결과 원본 JSON |
-| `debug-schema.json` | agy 출력 JSON 스키마 (추적 대상) |
+| `debug.json` | 디버거·리뷰어 결과 JSON |
+| `*-schema.json` | task 출력 JSON 스키마 (추적 대상) |
 
 ## 안전장치
 - `.claude/settings.json`: `git push` 와 `rm -rf` 는 **deny**. 외부 CLI 12분 / 셸 15분 타임아웃.
-- 디버거(`agy`)는 `--mode plan` 으로만 실행되어 **파일을 수정하지 않는다** (검증 항목 참고).
+- 외부 backend 는 읽기 전용으로만 실행되어 **파일을 수정하지 않는다** (agy `--mode plan`, codex `-s read-only`).
