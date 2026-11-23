@@ -1,13 +1,17 @@
 ".cca/runs/"
 
 # --- cca-workflow 런타임 산출물 ---
-# 주의: agy(--mode plan) 가 읽어야 하는 파일은 여기서 무시하지 않는다.
+# 주의: 외부 backend(agy·codex)가 파일로 읽어야 하는 것은 여기서 무시하지 않는다.
 #   많은 에이전트 CLI 가 .gitignore 된 파일을 읽기에서 제외하기 때문이다.
-#   따라서 .ai/prompts/, .ai/test.log, .ai/changes.diff, .ai/changes.status 는
-#   추적하지 않지만 .gitignore 에도 넣지 않는다(검증 5번에서 agy 가 읽는지 확인).
-#   커밋 시에는 `git add .` 대신 소스/문서만 선택적으로 add 한다.
+#   v0.2 부터 프롬프트 본문은 인자(agy)·stdin(codex)으로 직접 넘기므로 backend 가 읽는 파일은
+#   .ai/prompts/ 뿐이다(agy 프롬프트가 24,000자를 넘을 때 파일 지시로 대체). 그래서 이것만
+#   추적하지 않되 .gitignore 에도 넣지 않는다. 커밋 시에는 `git add .` 대신 선택적으로 add 한다.
+#   .ai/*-schema.json 은 도구 설정이라 커밋 대상이다.
 
-# agy 가 읽지 않는 순수 출력물만 무시
+# 실행할 때마다 다시 만들어지는 출력물 (지워도 다음 실행에 재생성)
+.ai/test.log
+.ai/changes.diff
+.ai/changes.status
 .ai/debug.json
 .ai/last-test.json
 .ai/dispute.json
