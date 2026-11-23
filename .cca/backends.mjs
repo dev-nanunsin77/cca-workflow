@@ -104,3 +104,61 @@ function nullable(s) {
   if (typeof s.type === 'string') return { ...s, type: [s.type, 'null'], ...(s.enum ? { enum: [...s.enum, null] } : {}) };
   return { anyOf: [s, { type: 'null' }] };
 }
+
+// ---------- 사용량 한도 조회 결과 해석 ----------
+// 두 backend 의 조회 결과를 같은 형태로 맞춘다:
+//   { windows: [{ window: '5h'|'weekly'|..., remaining: 0~1, resetAt: ISO|null }], reached: string|null, scope }
+// 해석할 수 없으면 null (조회 실패와 같게 취급해 확인을 건너뛴다).
+
+// agy `-p /usage --output-format json`. 모델 그룹별 한도 중 Gemini 그룹을 기준으로 본다
+// (agy 기본 모델 그룹. 다른 그룹 모델을 쓰도록 설정했다면 판정이 실제와 다를 수 있다).
+export function normalizeAgyUsage(json) {
+  const groups = json && json.command && json.command.data && json.command.data.groups;
+  if (!Array.isArray(groups) || groups.length === 0) return null;
+  const g = groups.find((x) => x.name === 'Gemini Models') || groups.find((x) => /gemini/i.test(x.name)) || groups[0];
+  const windows = (g.buckets || [])
+    .filter((b) => typeof b.remaining_fraction === 'number')
+    .map((b) => ({ window: b.window || b.id, remaining: b.remaining_fraction, resetAt: b.reset_time || null }));
+  if (windows.length === 0) return null;
+  return { windows, reached: null, scope: g.name };
+}
+
+// codex app-server `account/rateLimits/read` 의 result.
+export function normalizeCodexUsage(result) {
+  const rl = result && result.rateLimits;
+  if (!rl) return null;
+  const win = (w, fallback) =>
+    w && typeof w.usedPercent === 'number'
+      ? {
+          window:
+            w.windowDurationMins === 300 ? '5h'
+            : w.windowDurationMins === 10080 ? 'weekly'
+            : w.windowDurationMins != null ? `${w.windowDurationMins}m`
+            : fallback,
+          remaining: Math.max(0, 1 - w.usedPercent / 100),
+          resetAt: w.resetsAt ? new Date(w.resetsAt * 1000).toISOString() : null,
+        }
+      : null;
+  const windows = [win(rl.primary, 'primary'), win(rl.secondary, 'secondary')].filter(Boolean);
+  const reached =
+    rl.rateLimitReachedType || (rl.spendControlReached ? 'spend_control_reached' : null) ||
+    (result.ordinaryUsageAllowed === false ? 'ordinary_usage_not_allowed' : null);
+  if (windows.length === 0 && !reached) return null;
+  return { windows, reached, scope: rl.limitId || 'codex' };
+}
+
+// adapter 실패 중 '프로세스 비정상 종료'만 호출 후 한도 재확인 대상이다(빈 결과·형식 불일치는 제외).
+export function needsUsageRecheck(r) {
+  return !!r && !r.ok && !r.limitHit && /exit \d+/.test(r.reason || '');
+}
+
+// 한도 도달(또는 남은 비율이 minRemaining 이하)이면 사유 문자열, 아니면 null.
+export function usageBlocked(usage, minRemaining = 0.05) {
+  if (!usage) return null;
+  if (usage.reached) return `한도 도달(${usage.reached})`;
+  const low = usage.windows.filter((w) => w.remaining <= minRemaining);
+  if (low.length === 0) return null;
+  return low
+    .map((w) => `${w.window} 남은 ${Math.round(w.remaining * 100)}%${w.resetAt ? `, 초기화 ${w.resetAt}` : ''}`)
+    .join(' / ');
+}

@@ -133,3 +133,85 @@ test('validateRoles: roles·tasks 타입과 프로토타입 키를 막는다', (
 test('isLimitHit: stdout/stderr 가 null 이어도 안전', () => {
   assert.equal(isLimitHit({ status: 1, stdout: null, stderr: null }), false);
 });
+
+// ---------- 사용량 한도 조회 해석 (실제 관찰된 응답을 줄인 것) ----------
+import { normalizeAgyUsage, normalizeCodexUsage, usageBlocked } from '../backends.mjs';
+
+const AGY_USAGE = {
+  conversation_id: '',
+  status: 'SUCCESS',
+  num_turns: 0,
+  command: {
+    name: 'usage',
+    data: {
+      groups: [
+        {
+          name: 'Gemini Models',
+          buckets: [
+            { id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.986, reset_time: '2026-11-30T06:02:15Z' },
+            { id: 'gemini-5h', window: '5h', remaining_fraction: 0.04, reset_time: '2026-11-23T11:02:15Z' },
+          ],
+        },
+        { name: 'Claude and GPT models', buckets: [{ id: '3p-5h', window: '5h', remaining_fraction: 1, reset_time: 'x' }] },
+      ],
+    },
+  },
+};
+const CODEX_RESULT = {
+  ordinaryUsageAllowed: true,
+  rateLimits: {
+    limitId: 'codex',
+    primary: { usedPercent: 2, windowDurationMins: 300, resetsAt: 1795431695 },
+    secondary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1795998945 },
+    rateLimitReachedType: null,
+    spendControlReached: false,
+  },
+};
+
+test('normalizeAgyUsage: Gemini 그룹을 기준으로 창별 잔량을 읽는다', () => {
+  const u = normalizeAgyUsage(AGY_USAGE);
+  assert.equal(u.scope, 'Gemini Models');
+  assert.deepEqual(u.windows.map((w) => [w.window, w.remaining]), [['weekly', 0.986], ['5h', 0.04]]);
+});
+
+test('normalizeAgyUsage: 슬래시 명령이 아닌 응답(모델 턴)이면 null', () => {
+  assert.equal(normalizeAgyUsage({ status: 'SUCCESS', num_turns: 1, response: 'It looks like…' }), null);
+});
+
+test('normalizeCodexUsage: usedPercent → 남은 비율, 창 이름, 초기화 시각', () => {
+  const u = normalizeCodexUsage(CODEX_RESULT);
+  assert.deepEqual(u.windows.map((w) => [w.window, w.remaining]), [['5h', 0.98], ['weekly', 0.99]]);
+  assert.equal(u.windows[0].resetAt, new Date(1795431695 * 1000).toISOString());
+  assert.equal(u.reached, null);
+});
+
+test('normalizeCodexUsage: rateLimitReachedType·ordinaryUsageAllowed=false 를 도달로 본다', () => {
+  const reached = structuredClone(CODEX_RESULT);
+  reached.rateLimits.rateLimitReachedType = 'rate_limit_reached';
+  assert.equal(normalizeCodexUsage(reached).reached, 'rate_limit_reached');
+  const denied = { ...structuredClone(CODEX_RESULT), ordinaryUsageAllowed: false };
+  assert.equal(normalizeCodexUsage(denied).reached, 'ordinary_usage_not_allowed');
+  assert.equal(normalizeCodexUsage({}), null);
+});
+
+test('usageBlocked: 남은 비율 5% 이하 창이 있거나 도달이면 사유, 아니면 null', () => {
+  assert.match(usageBlocked(normalizeAgyUsage(AGY_USAGE), 0.05), /5h 남은 4%/);
+  assert.equal(usageBlocked(normalizeCodexUsage(CODEX_RESULT), 0.05), null);
+  assert.equal(usageBlocked({ windows: [{ window: '5h', remaining: 0.05 }], reached: null }, 0.05), '5h 남은 5%');
+  assert.match(usageBlocked({ windows: [], reached: 'rate_limit_reached' }), /한도 도달/);
+  assert.equal(usageBlocked(null), null); // 조회 실패 → 확인 건너뜀
+});
+
+test('needsUsageRecheck: 프로세스 비정상 종료만 재확인 대상', async () => {
+  const { needsUsageRecheck } = await import('../backends.mjs');
+  assert.equal(needsUsageRecheck({ ok: false, reason: 'exit 1' }), true);
+  assert.equal(needsUsageRecheck({ ok: false, reason: '사용량 한도 exit 1', limitHit: true }), false);
+  assert.equal(needsUsageRecheck({ ok: false, reason: '결과 없음 — 빈 응답' }), false);
+  assert.equal(needsUsageRecheck({ ok: false, reason: '타임아웃' }), false);
+  assert.equal(needsUsageRecheck({ ok: true }), false);
+});
+
+test('normalizeCodexUsage: 창 길이가 없거나 낯선 값이면 이름을 그대로/분 단위로', () => {
+  const u = normalizeCodexUsage({ rateLimits: { primary: { usedPercent: 10 }, secondary: { usedPercent: 0, windowDurationMins: 60 } } });
+  assert.deepEqual(u.windows.map((w) => w.window), ['primary', '60m']);
+});

@@ -17,7 +17,10 @@ import { fileURLToPath } from 'node:url';
 import { completeCoder, createRun, drive, findStep, recordDispute, validateWorkflow } from './engine.mjs';
 import { lockHash } from './lock.mjs';
 import { parseAgy, untrackedFiles, extractJson, tryParse } from './parse.mjs';
-import { backendLabel, backendsFor, isLimitHit, mapEffort, strictSchema, validateRoles, withFallback } from './backends.mjs';
+import {
+  backendLabel, backendsFor, isLimitHit, mapEffort, normalizeAgyUsage, normalizeCodexUsage,
+  needsUsageRecheck, strictSchema, usageBlocked, validateRoles, withFallback,
+} from './backends.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..'); // 저장소 루트
@@ -40,6 +43,8 @@ function loadConfig() {
     planFile: 'docs/plan.md',
     maxDebugRetries: 5,
     maxDisputeRejects: 2, // run 하나에서 dispute 기각이 이 횟수에 닿으면 escalated
+    usageCheck: true, // backend 호출 전 사용량 한도 확인(모델 호출 없음)
+    usageMinRemaining: 0.05, // 남은 비율이 이 값 이하면 그 backend 를 건너뜀
     pmReasoningEffort: 'medium',
     debugEffortFail: 'high',
     debugEffortReview: 'low',
@@ -239,12 +244,12 @@ function quoteArg(a) {
 // shell: true 는 .cmd 셰임(codex 등)용. 실행 파일(agy.exe)은 shell: false 로 직접 실행하면
 // cmd.exe 의 8191자 제한·줄바꿈 깨짐 없이 긴 프롬프트를 인자로 넘길 수 있다(CreateProcess 32767자).
 // input 을 주면 stdin 으로 전달한다(codex exec '-' 프롬프트).
-function run(cmd, args, { capture = false, label, shell = true, input } = {}) {
+function run(cmd, args, { capture = false, label, shell = true, input, timeoutMs = EXTERNAL_TIMEOUT_MS } = {}) {
   const start = process.hrtime.bigint();
   const stdin = input != null ? 'pipe' : 'ignore';
   const opts = {
     cwd: ROOT,
-    timeout: EXTERNAL_TIMEOUT_MS,
+    timeout: timeoutMs,
     encoding: 'utf8',
     stdio: capture ? [stdin, 'pipe', 'pipe'] : [stdin, 'inherit', 'inherit'],
     shell,
@@ -255,7 +260,7 @@ function run(cmd, args, { capture = false, label, shell = true, input } = {}) {
   const notFound = res.error && res.error.code === 'ENOENT';
   const timedOut = res.error && res.error.code === 'ETIMEDOUT';
   if (notFound) console.error(`[cca] '${cmd}' 실행 파일을 찾을 수 없습니다. PATH/로그인을 확인하세요.`);
-  if (timedOut) console.error(`[cca] '${cmd}' 가 ${EXTERNAL_TIMEOUT_MS / 60000}분 타임아웃.`);
+  if (timedOut) console.error(`[cca] '${cmd}' 가 ${(timeoutMs / 60000).toFixed(1)}분 타임아웃.`);
   console.log(`[cca] ⏱ ${label || cmd} ${(elapsedMs / 1000).toFixed(1)}s`);
   return {
     status: res.status == null ? (res.error ? 1 : 0) : res.status,
@@ -358,6 +363,84 @@ function invokeCodex(req) {
 
 const ADAPTERS = { agy: invokeAgy, codex: invokeCodex };
 
+// ---------- 사용량 한도 조회 (모델 호출 없음) ----------
+// agy: `agy -p /usage --output-format json` (슬래시 명령이라 모델 턴 없이 즉시 응답)
+// codex: app-server 의 account/rateLimits/read (.cca/codex-usage.mjs 경유)
+// 조회 실패는 null → 확인을 건너뛰고 평소대로 호출한다.
+const USAGE_TTL_MS = 5 * 60 * 1000;
+const USAGE_TIMEOUT_MS = 30 * 1000;
+const USAGE_PROBE_PATH = resolve(AI_DIR, 'usage-probe.json');
+const _usage = new Map();
+
+// agy 가 /usage 를 슬래시 명령으로 처리하지 못하는 버전이면 프롬프트로 받아 모델 턴을 쓴다.
+// 그런 버전은 기록해 두고 다시 조회하지 않는다(사용량 낭비 방지).
+function agyUsageUnsupported(version) {
+  return tryParse(readSafe(USAGE_PROBE_PATH) || 'null')?.agyUnsupported === version;
+}
+function markAgyUsageUnsupported(version) {
+  ensureDirs();
+  writeFileSync(USAGE_PROBE_PATH, JSON.stringify({ agyUnsupported: version }, null, 2), 'utf8');
+}
+
+function queryAgyUsage() {
+  const ver = run('agy', ['--version'], { capture: true, shell: false, label: 'agy --version', timeoutMs: USAGE_TIMEOUT_MS });
+  const version = (ver.stdout || '').trim() || 'unknown';
+  if (ver.notFound || agyUsageUnsupported(version)) return null;
+  const r = run('agy', ['-p', '/usage', '--output-format', 'json'], {
+    capture: true, shell: false, label: 'agy(usage)', timeoutMs: USAGE_TIMEOUT_MS,
+  });
+  if (r.status !== 0) return null;
+  const json = tryParse(r.stdout.trim());
+  if (json && !json.command && Number(json.num_turns) > 0) {
+    console.warn(`[cca] ⚠ agy ${version} 은 -p /usage 를 지원하지 않습니다(모델 턴으로 처리됨). 이 버전에서는 사용량 확인을 건너뜁니다.`);
+    markAgyUsageUnsupported(version);
+    return null;
+  }
+  return normalizeAgyUsage(json);
+}
+
+function queryCodexUsage() {
+  const r = run(process.execPath, [resolve(__dirname, 'codex-usage.mjs'), String(USAGE_TIMEOUT_MS - 5000)], {
+    capture: true, shell: false, label: 'codex(usage)', timeoutMs: USAGE_TIMEOUT_MS,
+  });
+  return r.status === 0 ? normalizeCodexUsage(tryParse(r.stdout.trim())) : null;
+}
+
+const USAGE_QUERIES = { agy: queryAgyUsage, codex: queryCodexUsage };
+
+function queryUsage(backend, { fresh = false } = {}) {
+  const hit = _usage.get(backend);
+  if (!fresh && hit && Date.now() - hit.at < USAGE_TTL_MS) return hit.usage;
+  let usage = null;
+  try {
+    usage = USAGE_QUERIES[backend] ? USAGE_QUERIES[backend]() : null;
+  } catch {
+    usage = null;
+  }
+  _usage.set(backend, { at: Date.now(), usage });
+  return usage;
+}
+
+// 호출 전 확인: 한도 근처면 호출하지 않고 실패로 돌려 다음 backend 로 넘긴다.
+// 호출 후 확인: 프로세스가 비정상 종료했으면 다시 조회해 한도 때문인지 판정한다.
+function invokeWithUsageCheck(b, req) {
+  const min = Number(CONFIG.usageMinRemaining);
+  const check = CONFIG.usageCheck !== false;
+  if (check) {
+    const blocked = usageBlocked(queryUsage(b), min);
+    if (blocked) {
+      console.warn(`[cca] ⚠ ${b} 사용량 한도 근처 — 호출하지 않음: ${blocked}`);
+      return { ok: false, limitHit: true, reason: `사용량 사전 확인: ${blocked}`, elapsedMs: 0 };
+    }
+  }
+  const r = ADAPTERS[b](req);
+  if (check && needsUsageRecheck(r)) {
+    const blocked = usageBlocked(queryUsage(b, { fresh: true }), min);
+    if (blocked) return { ...r, limitHit: true, reason: `사용량 한도(${blocked}) — ${r.reason}` };
+  }
+  return r;
+}
+
 // ---------- 역할 라우팅 (.cca/roles.json) ----------
 const TASK_NAMES = ['plan', 'write_tests', 'analyze_failure', 'review', 'judge_dispute'];
 const DEFAULT_ROLES = {
@@ -400,7 +483,7 @@ function invokeRole(task, req) {
     backends,
     (b) => {
       console.log(`[cca] ${task} → ${b} (role=${role}, effort=${mapEffort(b, req.effort)})`);
-      return ADAPTERS[b]({ ...req, label: `${b}(${req.name})` });
+      return invokeWithUsageCheck(b, { ...req, label: `${b}(${req.name})` });
     },
     { onFallback: (from, to, r) => console.warn(`[cca] ⚠ ${from} 실패(${r.reason}) → ${to} 로 대체`) }
   );
@@ -1046,7 +1129,8 @@ function usage() {
   node .cca/cca.mjs debug [fail|review]     디버거 실행 (모드 생략 시 자동판단)
   node .cca/cca.mjs dispute "<이의 내용>"   테스트 이의 판정(accept 시 교체)
   node .cca/cca.mjs lang                    적용될 언어 프리셋과 테스트 명령 출력
-  node .cca/cca.mjs roles                   task → 역할 → backend 순서(.cca/roles.json) 출력`);
+  node .cca/cca.mjs roles                   task → 역할 → backend 순서(.cca/roles.json) 출력
+  node .cca/cca.mjs usage                   backend 별 사용량 한도 잔량(모델 호출 없음)`);
 }
 
 const [sub, ...rest] = process.argv.slice(2);
@@ -1079,6 +1163,21 @@ switch (sub) {
   case 'dispute':
     code = cmdDispute(rest.join(' ').trim());
     break;
+  case 'usage': {
+    const min = Number(CONFIG.usageMinRemaining);
+    for (const b of Object.keys(USAGE_QUERIES)) {
+      const u = queryUsage(b, { fresh: true });
+      if (!u) {
+        console.log(`${b.padEnd(6)} 조회 실패(미설치·미지원·로그인 필요)`);
+        continue;
+      }
+      const wins = u.windows.map((w) => `${w.window} ${Math.round(w.remaining * 100)}% 남음${w.resetAt ? ` (초기화 ${w.resetAt})` : ''}`);
+      const blocked = usageBlocked(u, min);
+      console.log(`${b.padEnd(6)} [${u.scope}] ${wins.join(', ')}${u.reached ? ` 도달: ${u.reached}` : ''}${blocked ? ' → 건너뜀' : ''}`);
+    }
+    console.log(`기준: 남은 비율 ${Math.round(min * 100)}% 이하면 건너뜀 (config.usageMinRemaining)`);
+    break;
+  }
   case 'roles': {
     const cfg = getRoles();
     for (const t of TASK_NAMES) {

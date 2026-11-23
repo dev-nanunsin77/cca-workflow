@@ -77,7 +77,11 @@ INSTRUCTION: 디버거 분석(.ai/debug.json)을 검토해 구현을 고친다. 
 ```
 - 앞의 backend 가 **실패하면 다음 backend 로 넘긴다**: 실행 파일 없음, 타임아웃, 비정상 종료(사용량 한도 포함), 빈 결과·형식 불일치.
   fallback 이 일어나면 run 기록의 backend 가 `agy→codex` 처럼 남고, 앞 backend 의 실패 사유가 요약에 붙는다.
-- 사용량 한도는 CLI 출력의 일반적인 문구(`usage limit`, `rate limit`, `429`, `quota` 등)로 추정한다. **codex·agy 의 실제 한도 응답 형태는 아직 실측하지 못했다.**
+- **사용량 한도 확인(모델 호출 없음)**: backend 를 부르기 전에 잔량을 조회해, 남은 비율이 `usageMinRemaining`(기본 0.05) 이하인 창이 있거나 한도 도달이면 **호출하지 않고 다음 backend 로 넘긴다.** 호출이 비정상 종료하면 다시 조회해 한도 때문인지 판정한다. 확인: `node .cca/cca.mjs usage`
+  - agy: `agy -p /usage --output-format json` (슬래시 명령이라 모델 턴 없음). 모델 그룹 중 **Gemini 그룹** 기준(다른 그룹 모델을 쓰도록 설정했다면 실제와 다를 수 있음). `/usage` 를 모르는 버전이면 `.ai/usage-probe.json` 에 기록하고 그 버전에서는 다시 조회하지 않는다.
+  - codex: `codex app-server` 의 `account/rateLimits/read` (`.cca/codex-usage.mjs`). 5시간(`primary`)·주간(`secondary`) 창과 `rateLimitReachedType`. app-server 는 experimental 이라 버전에 따라 바뀔 수 있다. 같은 프로토콜의 한도 초기화 크레딧 소비 메서드는 호출하지 않는다.
+  - 조회가 실패하면 확인을 건너뛰고 평소대로 호출한다. 같은 프로세스 안에서는 5분 캐시. 끄려면 `"usageCheck": false`.
+  - 조회가 안 되는 경우를 위해 CLI 출력의 일반 문구(`usage limit`, `rate limit`, `429`, `quota` 등)로도 추정한다.
 - 모든 backend 는 읽기 전용으로 실행한다(codex `-s read-only`, agy `--mode plan`). 파일 쓰기(plan, 테스트)는 cca 가 결과를 받아 수행한다.
 - 프롬프트 전달: codex 는 stdin(`exec -`), agy 는 인자로 직접(24,000자 초과 시에만 파일 지시). JSON task 는 codex `--output-schema` / agy `--json-schema` 로 강제하며,
   codex 용 스키마는 OpenAI 구조화 출력 규칙(모든 속성 required, `additionalProperties: false`, 선택 속성은 `null` 허용)으로 변환해 `.ai/out/` 에 만든다.
@@ -103,6 +107,9 @@ node .cca/cca.mjs debug review                   # 강제: 코드 리뷰
 - `language`: `auto` | `node` | `python` | `rust` | `cpp`. PM 의 인터페이스 계약, 테스트 작성 규칙, 테스트 명령, 결과 집계가 모두 이 값을 따른다.
 - `framework`: 언어별 대안 러너. 현재 `python` 의 `"pytest"` 만 있음 (기본은 `unittest`).
 - `testCommand`: 지정하면 프리셋의 테스트 명령을 덮어쓴다.
+- `maxDebugRetries`: workflow 의 `maxVisits: "maxDebugRetries"` step(원인분석·리뷰) 반복 한도.
+- `maxDisputeRejects`: run 하나에서 dispute 기각이 이 횟수(기본 2)에 닿으면 사람에게 보고.
+- `usageCheck` / `usageMinRemaining`: backend 호출 전 사용량 한도 확인 여부(기본 `true`)와 건너뛰는 기준(남은 비율, 기본 `0.05`).
 - 적용 결과 확인: `node .cca/cca.mjs lang`
 
 ## 지원 언어
