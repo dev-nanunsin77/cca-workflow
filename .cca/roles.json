@@ -1,0 +1,16 @@
+{
+  "roles": {
+    "pm": { "backends": ["codex", "agy"] },
+    "tester": { "backends": ["agy", "codex"] },
+    "debugger": { "backends": ["agy", "codex"] },
+    "reviewer": { "backends": ["agy", "codex"] },
+    "judge": { "backends": ["agy", "codex"] }
+  },
+  "tasks": {
+    "plan": "pm",
+    "write_tests": "tester",
+    "analyze_failure": "debugger",
+    "review": "reviewer",
+    "judge_dispute": "judge"
+  }
+}

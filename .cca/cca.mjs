@@ -16,7 +16,8 @@ import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { completeCoder, createRun, drive, findStep, recordDispute, validateWorkflow } from './engine.mjs';
 import { lockHash } from './lock.mjs';
-import { parseAgy, untrackedFiles } from './parse.mjs';
+import { parseAgy, untrackedFiles, extractJson, tryParse } from './parse.mjs';
+import { backendLabel, backendsFor, isLimitHit, mapEffort, strictSchema, validateRoles, withFallback } from './backends.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..'); // 저장소 루트
@@ -237,14 +238,17 @@ function quoteArg(a) {
 // 외부 명령 실행 (타임아웃 + 소요시간 출력).
 // shell: true 는 .cmd 셰임(codex 등)용. 실행 파일(agy.exe)은 shell: false 로 직접 실행하면
 // cmd.exe 의 8191자 제한·줄바꿈 깨짐 없이 긴 프롬프트를 인자로 넘길 수 있다(CreateProcess 32767자).
-function run(cmd, args, { capture = false, label, shell = true } = {}) {
+// input 을 주면 stdin 으로 전달한다(codex exec '-' 프롬프트).
+function run(cmd, args, { capture = false, label, shell = true, input } = {}) {
   const start = process.hrtime.bigint();
+  const stdin = input != null ? 'pipe' : 'ignore';
   const opts = {
     cwd: ROOT,
     timeout: EXTERNAL_TIMEOUT_MS,
     encoding: 'utf8',
-    stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+    stdio: capture ? [stdin, 'pipe', 'pipe'] : [stdin, 'inherit', 'inherit'],
     shell,
+    ...(input != null ? { input } : {}),
   };
   const res = shell ? spawnSync([cmd, ...args.map(quoteArg)].join(' '), opts) : spawnSync(cmd, args, opts);
   const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
@@ -272,41 +276,140 @@ function followInstruction(relPath) {
   return `Read the file ${relPath} and follow its instructions exactly.`;
 }
 
-// ---------- agy 호출 ----------
-// 프롬프트는 인자로 직접 넘긴다. "파일을 읽어라" 간접 지시는 agy(plan 모드)가 셸로 파일을 찾다
-// 권한 거부(denied_actions)되고 빈 결과로 끝나는 일이 있다. 한도를 넘는 프롬프트만 파일 지시로 대체.
-// CreateProcess 한도 32767자에서 다른 인자와 따옴표 이스케이프(\") 증가분 여유를 둔다
-const AGY_INLINE_MAX = 24000;
+// ---------- backend adapter ----------
+// adapter(req) → { ok, data?, text?, reason?, limitHit?, elapsedMs }
+// req: { name, prompt, schema(스키마 파일 경로|null), key, accept(data), effort, label }
+//   schema 가 있으면 JSON 결과(data), 없으면 텍스트 결과(text).
+// 모든 backend 는 읽기 전용으로 실행한다. 파일 쓰기는 cca 가 결과를 받아 수행한다.
 const SEVERITIES = ['critical', 'major', 'minor', 'none'];
 
-function runAgy(name, promptBody, { effort, schema, label }) {
-  const rel = writePrompt(name, promptBody);
-  const inline = promptBody.length <= AGY_INLINE_MAX;
-  if (!inline) console.warn(`[cca] ⚠ 프롬프트가 ${promptBody.length}자라 파일 지시(${rel})로 전달합니다.`);
-  const args = (prompt) => ['-p', prompt, '--mode', 'plan', '--effort', effort,
-    '--output-format', 'json', '--json-schema', schema, '--print-timeout', '5m'];
-  const r = run('agy', args(inline ? promptBody : followInstruction(rel)), { capture: true, label, shell: false });
+// 프로세스 수준 실패 판정(실행 파일 없음·타임아웃·비정상 종료). 정상이면 null.
+function processFailure(backend, r) {
+  if (r.notFound) return { ok: false, reason: '실행 파일 없음', elapsedMs: r.elapsedMs };
+  if (r.timedOut) return { ok: false, reason: '타임아웃', elapsedMs: r.elapsedMs };
+  if (r.status !== 0) {
+    const limitHit = isLimitHit(r);
+    const tail = (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' ').slice(0, 200);
+    if (tail) console.error(`[cca] ${backend}: ${tail}`);
+    return { ok: false, limitHit, reason: `${limitHit ? '사용량 한도 ' : ''}exit ${r.status}`, elapsedMs: r.elapsedMs };
+  }
+  return null;
+}
+
+// agy: 프롬프트를 인자로 직접 넘긴다. "파일을 읽어라" 간접 지시는 agy(plan 모드)가 셸로 파일을
+// 찾다 권한 거부(denied_actions)되고 빈 결과로 끝나는 일이 있다. 한도를 넘는 프롬프트만 파일 지시.
+// CreateProcess 한도 32767자에서 다른 인자와 따옴표 이스케이프(\") 증가분 여유를 둔다
+const AGY_INLINE_MAX = 24000;
+
+function invokeAgy(req) {
+  const rel = writePrompt(req.name, req.prompt);
+  const inline = req.prompt.length <= AGY_INLINE_MAX;
+  if (!inline) console.warn(`[cca] ⚠ 프롬프트가 ${req.prompt.length}자라 파일 지시(${rel})로 전달합니다.`);
+  const args = (prompt) => ['-p', prompt, '--mode', 'plan', '--effort', mapEffort('agy', req.effort),
+    '--output-format', 'json', ...(req.schema ? ['--json-schema', req.schema] : []), '--print-timeout', '5m'];
+  let r = run('agy', args(inline ? req.prompt : followInstruction(rel)), { capture: true, label: req.label, shell: false });
   // 셸 없이는 .exe 만 찾는다. agy 가 .cmd 셰임으로 설치된 환경이면 셸 + 파일 지시로 대체
   if (r.notFound && process.platform === 'win32') {
     console.warn('[cca] ⚠ agy 실행 파일(.exe)을 찾지 못해 셸 경유(파일 지시)로 재시도합니다.');
-    return run('agy', args(followInstruction(rel)), { capture: true, label });
+    r = run('agy', args(followInstruction(rel)), { capture: true, label: req.label });
   }
-  return r;
+  const fail = processFailure('agy', r);
+  if (fail) return fail;
+  if (req.schema) {
+    const p = parseAgy(r.stdout, req.key, req.accept);
+    if (p.data) return { ok: true, data: p.data, elapsedMs: r.elapsedMs };
+    console.error(`[cca] agy 결과가 비었거나 형식이 다릅니다: ${p.diag}`);
+    return { ok: false, reason: `결과 없음 — ${p.diag}`, elapsedMs: r.elapsedMs };
+  }
+  const outer = tryParse(r.stdout.trim());
+  const text = outer && typeof outer.response === 'string' ? outer.response.trim() : '';
+  return text ? { ok: true, text, elapsedMs: r.elapsedMs } : { ok: false, reason: '빈 응답', elapsedMs: r.elapsedMs };
 }
 
-// agy 실행 실패(프로세스) 또는 결과 없음(parseAgy) 이면 사유 문자열, 정상이면 null
-function agyFailed(r, label, parsed) {
-  if (r.notFound || r.timedOut || r.status !== 0) {
-    console.error(`[cca] ${label} 실행 실패.`);
-    if (r.stderr) console.error(r.stderr.trim());
-    return `${label} 실행 실패${r.timedOut ? '(타임아웃)' : r.notFound ? '(실행 파일 없음)' : ` (exit ${r.status})`}`;
+// codex: 프롬프트를 stdin('-')으로 넘기고, 마지막 메시지를 -o 파일로 받는다.
+// JSON task 는 --output-schema 로 강제하되, OpenAI 구조화 출력 규칙에 맞춘 엄격 스키마로 변환해 쓴다.
+function invokeCodex(req) {
+  writePrompt(req.name, req.prompt);
+  const outDir = resolve(AI_DIR, 'out');
+  mkdirSync(outDir, { recursive: true });
+  const outFile = resolve(outDir, `${req.name}.codex.txt`);
+  writeFileSync(outFile, '', 'utf8');
+  const schemaArgs = [];
+  if (req.schema) {
+    const strictPath = resolve(outDir, `${req.name}.codex-schema.json`);
+    writeFileSync(strictPath, JSON.stringify(strictSchema(JSON.parse(readSafe(resolve(ROOT, req.schema)))), null, 2), 'utf8');
+    schemaArgs.push('--output-schema', relative(ROOT, strictPath).replace(/\\/g, '/'));
   }
-  if (!parsed.data) {
-    console.error(`[cca] ${label} 결과가 비었거나 형식이 다릅니다: ${parsed.diag}`);
-    console.error(`[cca] 원본: ${r.stdout.slice(0, 2000)}`);
-    return `결과 없음 — ${parsed.diag}`;
+  const r = run(
+    'codex',
+    ['exec', '-c', `model_reasoning_effort=${mapEffort('codex', req.effort)}`, '-s', 'read-only',
+      ...schemaArgs, '-o', relative(ROOT, outFile).replace(/\\/g, '/'), '-'],
+    { capture: true, label: req.label, input: req.prompt }
+  );
+  const fail = processFailure('codex', r);
+  if (fail) return fail;
+  const text = readSafe(outFile).trim();
+  if (!text) return { ok: false, reason: '빈 응답', elapsedMs: r.elapsedMs };
+  if (!req.schema) return { ok: true, text, elapsedMs: r.elapsedMs };
+  const data = extractJson(text, req.key);
+  if (data && req.accept(data)) return { ok: true, data, elapsedMs: r.elapsedMs };
+  return { ok: false, reason: `결과 형식 불일치 — ${text.slice(0, 160).replace(/\s+/g, ' ')}`, elapsedMs: r.elapsedMs };
+}
+
+const ADAPTERS = { agy: invokeAgy, codex: invokeCodex };
+
+// ---------- 역할 라우팅 (.cca/roles.json) ----------
+const TASK_NAMES = ['plan', 'write_tests', 'analyze_failure', 'review', 'judge_dispute'];
+const DEFAULT_ROLES = {
+  roles: {
+    pm: { backends: ['codex', 'agy'] },
+    tester: { backends: ['agy', 'codex'] },
+    debugger: { backends: ['agy', 'codex'] },
+    reviewer: { backends: ['agy', 'codex'] },
+    judge: { backends: ['agy', 'codex'] },
+  },
+  tasks: { plan: 'pm', write_tests: 'tester', analyze_failure: 'debugger', review: 'reviewer', judge_dispute: 'judge' },
+};
+
+let _roles;
+function getRoles() {
+  if (_roles) return _roles;
+  const p = resolve(__dirname, 'roles.json');
+  let cfg = DEFAULT_ROLES;
+  if (existsSync(p)) {
+    cfg = tryParse(readFileSync(p, 'utf8'));
+    if (!cfg) {
+      console.error('[cca] .cca/roles.json 파싱 실패.');
+      process.exit(2);
+    }
   }
-  return null;
+  const errors = validateRoles(cfg, { tasks: TASK_NAMES });
+  if (errors.length) {
+    console.error('[cca] .cca/roles.json 정의 오류:');
+    for (const e of errors) console.error(`  - ${e}`);
+    process.exit(2);
+  }
+  _roles = cfg;
+  return cfg;
+}
+
+// task 를 역할의 backend 순서대로 시도한다. 반환: withFallback 결과 + label('agy→codex' 등)
+function invokeRole(task, req) {
+  const { role, backends } = backendsFor(getRoles(), task);
+  const res = withFallback(
+    backends,
+    (b) => {
+      console.log(`[cca] ${task} → ${b} (role=${role}, effort=${mapEffort(b, req.effort)})`);
+      return ADAPTERS[b]({ ...req, label: `${b}(${req.name})` });
+    },
+    { onFallback: (from, to, r) => console.warn(`[cca] ⚠ ${from} 실패(${r.reason}) → ${to} 로 대체`) }
+  );
+  return { ...res, label: backendLabel(res) };
+}
+
+// run 기록용 요약: fallback 이 있었으면 앞 backend 의 실패 사유를 붙인다.
+function attemptNote(res) {
+  return res.attempts.map((a) => `${a.backend}: ${a.reason}`).join(' / ');
 }
 function tailLines(text, n = TAIL_LINES) {
   const lines = (text || '').split('\n');
@@ -400,7 +503,7 @@ function taskPlan(requirement) {
   const promptBody = [
     '너는 PM이다. 아래 요구사항을 분석해 Markdown 문서를 작성한다.',
     '',
-    '**중요: 파일을 쓰지 말고 문서를 응답(표준 출력)으로만 내보내라.** 저장은 호출 측의 -o 옵션이 처리한다.',
+    '**중요: 파일을 쓰지 말고 문서를 응답으로만 내보내라.** 응답 전체가 그대로 plan 파일로 저장되므로 문서 앞뒤에 설명 문장을 붙이지 마라.',
     '',
     '문서는 **정확히 다음 6개 제목**을 순서대로 포함해야 한다:',
     '- `## 목표`',
@@ -420,22 +523,19 @@ function taskPlan(requirement) {
     requirement,
     '',
   ].join('\n');
-  const rel = writePrompt('pm', promptBody);
   const planFile = CONFIG.planFile || 'docs/plan.md';
   const effort = CONFIG.pmReasoningEffort || 'medium';
-  console.log(`[cca] PM(codex) 실행 (effort=${effort}) → ${planFile}`);
-  const r = run(
-    'codex',
-    ['exec', '-c', `model_reasoning_effort=${effort}`, followInstruction(rel), '-s', 'read-only', '-o', planFile],
-    { label: 'codex(pm)' }
-  );
-  const base = { backend: 'codex', elapsedMs: r.elapsedMs, artifact: planFile };
-  if (r.status === 0 && existsSync(resolve(ROOT, planFile))) {
-    console.log(`[cca] plan 생성 완료: ${planFile}`);
-    return { ...base, result: 'ok' };
+  const res = invokeRole('plan', { name: 'pm', prompt: promptBody, schema: null, effort });
+  const base = { backend: res.label, elapsedMs: res.elapsedMs, artifact: planFile };
+  if (!res.ok) {
+    console.error('[cca] PM 단계 실패.');
+    return { ...base, result: 'error', summary: attemptNote(res) };
   }
-  console.error('[cca] PM 단계 실패.');
-  return { ...base, result: 'error', summary: `codex exit ${r.status}` };
+  const abs = resolve(ROOT, planFile);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, res.text + '\n', 'utf8');
+  console.log(`[cca] plan 생성 완료: ${planFile}`);
+  return { ...base, result: 'ok', ...(res.attempts.length ? { summary: attemptNote(res) } : {}) };
 }
 
 // ---------- task: write_tests (테스트 선작성 + 잠금) ----------
@@ -466,13 +566,17 @@ function taskWriteTests() {
     '===== plan.md =====',
     readSafe(planAbs),
   ].join('\n');
-  console.log(`[cca] 테스트 작성(agy, effort=${effort})...`);
-  const r = runAgy('tests', promptBody, { effort, schema: '.ai/tests-schema.json', label: 'agy(tests)' });
-  const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/test-lock.json' };
-  const p = parseAgy(r.stdout, 'files', (d) => Array.isArray(d.files) && d.files.length > 0);
-  const failMsg = agyFailed(r, 'agy(tests)', p);
-  if (failMsg) return { ...base, result: 'error', summary: failMsg };
-  const parsed = p.data;
+  const res = invokeRole('write_tests', {
+    name: 'tests',
+    prompt: promptBody,
+    schema: '.ai/tests-schema.json',
+    key: 'files',
+    accept: (d) => Array.isArray(d.files) && d.files.length > 0,
+    effort,
+  });
+  const base = { backend: res.label, elapsedMs: res.elapsedMs, artifact: '.ai/test-lock.json' };
+  if (!res.ok) return { ...base, result: 'error', summary: attemptNote(res) };
+  const parsed = res.data;
 
   const map = saveFiles(parsed.files);
   if (Object.keys(map).length === 0) {
@@ -572,13 +676,17 @@ function taskDispute(claim) {
     '===== 현재 잠긴 테스트 =====',
     lockedFiles,
   ].join('\n');
-  console.log(`[cca] 이의 판정(agy, effort=${effort})...`);
-  const r = runAgy('dispute', promptBody, { effort, schema: '.ai/dispute-schema.json', label: 'agy(dispute)' });
-  const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/dispute.json' };
-  const p = parseAgy(r.stdout, 'verdict', (d) => d.verdict === 'accept' || d.verdict === 'reject');
-  const failMsg = agyFailed(r, 'agy(dispute)', p);
-  if (failMsg) return { ...base, result: 'error', summary: failMsg };
-  const parsed = p.data;
+  const res = invokeRole('judge_dispute', {
+    name: 'dispute',
+    prompt: promptBody,
+    schema: '.ai/dispute-schema.json',
+    key: 'verdict',
+    accept: (d) => d.verdict === 'accept' || d.verdict === 'reject',
+    effort,
+  });
+  const base = { backend: res.label, elapsedMs: res.elapsedMs, artifact: '.ai/dispute.json' };
+  if (!res.ok) return { ...base, result: 'error', summary: attemptNote(res) };
+  const parsed = res.data;
   writeFileSync(resolve(AI_DIR, 'dispute.json'), JSON.stringify(parsed, null, 2), 'utf8');
 
   console.log('\n===== 이의 판정 =====');
@@ -599,7 +707,7 @@ function taskDispute(claim) {
   return { ...base, result: parsed.verdict, summary: parsed.reason ?? null };
 }
 
-// ---------- task: analyze_failure / review (agy 디버거) ----------
+// ---------- task: analyze_failure / review (디버거·리뷰어) ----------
 // 디버그 모드 자동판단: 마지막 테스트가 통과면 review, 아니면 fail
 function autoDebugMode() {
   try {
@@ -669,18 +777,18 @@ function taskDebug(mode) {
       '',
     ];
   }
-  console.log('[cca] 디버거(agy) 실행...');
-  const r = runAgy('debug', [...header, ...attachments].join('\n'), {
-    effort,
+  const res = invokeRole(mode === 'fail' ? 'analyze_failure' : 'review', {
+    name: 'debug',
+    prompt: [...header, ...attachments].join('\n'),
     schema: '.ai/debug-schema.json',
-    label: `agy(${mode})`,
+    key: 'severity',
+    // severity 가 없으면 'none' 으로 간주하지 않는다(빈 결과가 리뷰 통과로 처리되는 것을 막음)
+    accept: (d) => SEVERITIES.includes(d.severity),
+    effort,
   });
-  const base = { backend: 'agy', elapsedMs: r.elapsedMs, artifact: '.ai/debug.json' };
-  // severity 가 없으면 'none' 으로 간주하지 않는다(빈 결과가 리뷰 통과로 처리되는 것을 막음)
-  const p = parseAgy(r.stdout, 'severity', (d) => SEVERITIES.includes(d.severity));
-  const failMsg = agyFailed(r, `agy(${mode})`, p);
-  if (failMsg) return { ...base, result: 'error', summary: failMsg };
-  const parsed = p.data;
+  const base = { backend: res.label, elapsedMs: res.elapsedMs, artifact: '.ai/debug.json' };
+  if (!res.ok) return { ...base, result: 'error', summary: attemptNote(res) };
+  const parsed = res.data;
   writeFileSync(resolve(AI_DIR, 'debug.json'), JSON.stringify(parsed, null, 2), 'utf8');
 
   const severity = parsed.severity;
@@ -932,12 +1040,13 @@ function usage() {
   사용 가능한 workflow: ${listWorkflows().join(', ') || '없음'}
 
 단일 명령:
-  node .cca/cca.mjs pm "<요구사항>"        PM(codex)로 docs/plan.md 생성
+  node .cca/cca.mjs pm "<요구사항>"        PM 역할로 docs/plan.md 생성
   node .cca/cca.mjs tests                   plan 기반 테스트 선작성 + 잠금 + red 확인
   node .cca/cca.mjs test                    잠금 검증 후 테스트 실행
-  node .cca/cca.mjs debug [fail|review]     디버거(agy) 실행 (모드 생략 시 자동판단)
-  node .cca/cca.mjs dispute "<이의 내용>"   테스트 이의를 agy 가 판정(accept 시 교체)
-  node .cca/cca.mjs lang                    적용될 언어 프리셋과 테스트 명령 출력`);
+  node .cca/cca.mjs debug [fail|review]     디버거 실행 (모드 생략 시 자동판단)
+  node .cca/cca.mjs dispute "<이의 내용>"   테스트 이의 판정(accept 시 교체)
+  node .cca/cca.mjs lang                    적용될 언어 프리셋과 테스트 명령 출력
+  node .cca/cca.mjs roles                   task → 역할 → backend 순서(.cca/roles.json) 출력`);
 }
 
 const [sub, ...rest] = process.argv.slice(2);
@@ -970,6 +1079,14 @@ switch (sub) {
   case 'dispute':
     code = cmdDispute(rest.join(' ').trim());
     break;
+  case 'roles': {
+    const cfg = getRoles();
+    for (const t of TASK_NAMES) {
+      const { role, backends } = backendsFor(cfg, t);
+      console.log(`${t.padEnd(16)} ${role.padEnd(10)} ${backends.join(' → ')}`);
+    }
+    break;
+  }
   case 'lang':
     console.log(`language: ${getLang().key} (${getLang().label})`);
     console.log(`testCommand: ${getLang().testCommand}`);
