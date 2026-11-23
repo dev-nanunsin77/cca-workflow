@@ -16,7 +16,7 @@ import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { completeCoder, createRun, drive, findStep, recordDispute, validateWorkflow } from './engine.mjs';
 import { lockHash } from './lock.mjs';
-import { parseAgy, untrackedFiles, extractJson, tryParse } from './parse.mjs';
+import { agyDiag, parseAgy, untrackedFiles, extractJson, tryParse } from './parse.mjs';
 import {
   backendLabel, backendsFor, isLimitHit, mapEffort, normalizeAgyUsage, normalizeCodexUsage,
   needsUsageRecheck, strictSchema, usageBlocked, validateRoles, withFallback,
@@ -306,13 +306,25 @@ function processFailure(backend, r) {
 // CreateProcess 한도 32767자에서 다른 인자와 따옴표 이스케이프(\") 증가분 여유를 둔다
 const AGY_INLINE_MAX = 24000;
 
+// plan 모드 agy 는 과제를 받으면 저장소부터 살펴보려고 셸을 쓰다 권한 거부되고 빈 응답으로
+// 끝나는 일이 있다(plan 작성·테스트 작성에서 관찰). 필요한 정보는 모두 프롬프트에 넣었으니
+// 도구를 쓰지 말고 바로 답하라고 모든 agy 프롬프트 앞에 못박는다.
+const AGY_PREAMBLE = [
+  '[실행 규칙] 이 지시문에 필요한 정보가 모두 들어 있다. 이 지시문 외의 파일을 읽거나',
+  '셸·검색·편집 도구를 쓰지 말고, 저장소를 탐색하지 말고, 바로 최종 답을 출력하라.',
+  '되묻지 마라. 모호한 부분은 합리적으로 정해서 답에 반영하라.',
+  '',
+  '',
+].join('\n');
+
 function invokeAgy(req) {
-  const rel = writePrompt(req.name, req.prompt);
-  const inline = req.prompt.length <= AGY_INLINE_MAX;
-  if (!inline) console.warn(`[cca] ⚠ 프롬프트가 ${req.prompt.length}자라 파일 지시(${rel})로 전달합니다.`);
+  const body = AGY_PREAMBLE + req.prompt;
+  const rel = writePrompt(req.name, body);
+  const inline = body.length <= AGY_INLINE_MAX;
+  if (!inline) console.warn(`[cca] ⚠ 프롬프트가 ${body.length}자라 파일 지시(${rel})로 전달합니다.`);
   const args = (prompt) => ['-p', prompt, '--mode', 'plan', '--effort', mapEffort('agy', req.effort),
     '--output-format', 'json', ...(req.schema ? ['--json-schema', req.schema] : []), '--print-timeout', '5m'];
-  let r = run('agy', args(inline ? req.prompt : followInstruction(rel)), { capture: true, label: req.label, shell: false });
+  let r = run('agy', args(inline ? body : followInstruction(rel)), { capture: true, label: req.label, shell: false });
   // 셸 없이는 .exe 만 찾는다. agy 가 .cmd 셰임으로 설치된 환경이면 셸 + 파일 지시로 대체
   if (r.notFound && process.platform === 'win32') {
     console.warn('[cca] ⚠ agy 실행 파일(.exe)을 찾지 못해 셸 경유(파일 지시)로 재시도합니다.');
@@ -328,7 +340,10 @@ function invokeAgy(req) {
   }
   const outer = tryParse(r.stdout.trim());
   const text = outer && typeof outer.response === 'string' ? outer.response.trim() : '';
-  return text ? { ok: true, text, elapsedMs: r.elapsedMs } : { ok: false, reason: '빈 응답', elapsedMs: r.elapsedMs };
+  if (text) return { ok: true, text, elapsedMs: r.elapsedMs };
+  const diag = agyDiag(outer);
+  console.error(`[cca] agy 결과가 비었습니다: ${diag}`);
+  return { ok: false, reason: `결과 없음 — ${diag}`, elapsedMs: r.elapsedMs };
 }
 
 // codex: 프롬프트를 stdin('-')으로 넘기고, 마지막 메시지를 -o 파일로 받는다.

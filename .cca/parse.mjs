@@ -13,12 +13,17 @@ export function parseAgy(stdout, key, accept) {
     data = extractJson(stdout, key);
   }
   if (data && accept(data)) return { data };
+  return { data: null, diag: agyDiag(outer) };
+}
+
+// agy 외곽 JSON 에서 실패 원인 파악용 진단 문자열(권한 거부된 도구, 응답 앞부분)
+export function agyDiag(outer) {
   const diag = [];
   const denied = outer && Array.isArray(outer.denied_actions) ? outer.denied_actions : [];
   if (denied.length) diag.push(`권한 거부: ${denied.map((d) => d.display_name || d.action).join(', ')}`);
   const resp = outer && typeof outer.response === 'string' ? outer.response.trim() : '';
   diag.push(resp ? `응답: ${resp.slice(0, 160).replace(/\s+/g, ' ')}` : '빈 응답');
-  return { data: null, diag: diag.join(' / ') };
+  return diag.join(' / ');
 }
 
 // `git status --porcelain -uall` 출력에서 리뷰에 첨부할 신규(untracked) 파일 경로 목록.
