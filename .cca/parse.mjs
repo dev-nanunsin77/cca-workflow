@@ -21,6 +21,18 @@ export function parseAgy(stdout, key, accept) {
   return { data: null, diag: diag.join(' / ') };
 }
 
+// `git status --porcelain -uall` 출력에서 리뷰에 첨부할 신규(untracked) 파일 경로 목록.
+// cca 런타임 산출물(.ai/)과, -uall 없이 실행된 경우의 디렉터리 항목(`dir/`)은 뺀다.
+// 특수문자 경로는 git 이 큰따옴표로 감싸므로 벗긴다.
+export function untrackedFiles(porcelain) {
+  return (porcelain || '')
+    .split(/\r?\n/)
+    .filter((l) => l.startsWith('?? '))
+    .map((l) => l.slice(3).trim())
+    .map((f) => (f.length > 1 && f.startsWith('"') && f.endsWith('"') ? f.slice(1, -1) : f))
+    .filter((f) => f && !f.startsWith('.ai/') && !f.endsWith('/'));
+}
+
 // 텍스트에서 특정 key 를 가진 객체를 견고하게 추출
 export function extractJson(text, key) {
   const trimmed = (text || '').trim();

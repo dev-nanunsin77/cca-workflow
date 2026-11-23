@@ -1,7 +1,7 @@
 // agy 출력 해석 단위 테스트. 입력은 실제로 관찰된 agy 1.5.14 출력 형태를 줄인 것.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAgy } from '../parse.mjs';
+import { parseAgy, untrackedFiles } from '../parse.mjs';
 
 const FILES_SCHEMA = {
   type: 'object',
@@ -81,4 +81,24 @@ test('외곽 래퍼 없이 결과 JSON 만 온 경우도 처리한다', () => {
 test('JSON 이 아니면 실패', () => {
   const p = parseAgy('Error: something', 'files', hasFiles);
   assert.equal(p.data, null);
+});
+
+test('untrackedFiles: -uall 출력에서 새 디렉터리 안 파일을 모두 고른다', () => {
+  const out = [
+    ' M .cca/config.json',
+    ' M docs/plan.md',
+    '?? Cargo.lock',
+    '?? Cargo.toml',
+    '?? src/lib.rs',
+    '?? tests/parse.rs',
+    '?? .ai/changes.diff',
+    '?? .ai/prompts/debug.md',
+    '',
+  ].join('\r\n');
+  assert.deepEqual(untrackedFiles(out), ['Cargo.lock', 'Cargo.toml', 'src/lib.rs', 'tests/parse.rs']);
+});
+
+test('untrackedFiles: 디렉터리 항목은 빼고, 따옴표 경로는 벗긴다', () => {
+  const out = '?? src/\n?? "my file.rs"\n?? 한글/파일.rs\n';
+  assert.deepEqual(untrackedFiles(out), ['my file.rs', '한글/파일.rs']);
 });

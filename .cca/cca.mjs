@@ -16,7 +16,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { completeCoder, createRun, drive, findStep, recordDispute, validateWorkflow } from './engine.mjs';
-import { parseAgy } from './parse.mjs';
+import { parseAgy, untrackedFiles } from './parse.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..'); // 저장소 루트
@@ -621,14 +621,14 @@ function taskDebug(mode) {
 
   const diff = run('git', ['diff'], { capture: true, label: 'git diff' });
   writeFileSync(resolve(AI_DIR, 'changes.diff'), diff.stdout, 'utf8');
-  const status = run('git', ['status', '--porcelain'], { capture: true, label: 'git status' });
+  // -uall: 새 디렉터리를 `?? src/` 로 접지 않고 안의 파일을 하나씩 나열한다.
+  // core.quotePath=false: 한글 등 비ASCII 경로를 8진 이스케이프 없이 그대로 받는다.
+  const status = run('git', ['-c', 'core.quotePath=false', 'status', '--porcelain', '-uall'], {
+    capture: true,
+    label: 'git status',
+  });
   writeFileSync(resolve(AI_DIR, 'changes.status'), status.stdout, 'utf8');
-  const untracked = status.stdout
-    .split('\n')
-    .filter((l) => l.startsWith('??'))
-    .map((l) => l.slice(3).trim())
-    .filter(Boolean)
-    .filter((f) => !f.startsWith('.ai/') && !f.endsWith('/'));
+  const untracked = untrackedFiles(status.stdout);
 
   const inlineFiles = [];
   const bigFiles = [];
